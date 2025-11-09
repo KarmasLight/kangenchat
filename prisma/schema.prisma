@@ -43,6 +43,7 @@ model ChatSession {
   visitorId String?
   issueType String?
   closedReason String?
+  closedAt  DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

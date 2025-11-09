@@ -63,7 +63,7 @@ app.post('/sessions/start', async (req, res) => {
 app.get('/sessions/:id', authMiddleware, async (req, res) => {
   const session = await prisma.chatSession.findUnique({
     where: { id: req.params.id },
-    select: { id: true, issueType: true, status: true, visitor: { select: { id: true, name: true, email: true } } },
+    select: { id: true, issueType: true, status: true, createdAt: true, closedAt: true, visitor: { select: { id: true, name: true, email: true } } },
   });
   if (!session) return res.status(404).json({ error: 'Session not found' });
   res.json(session);
@@ -75,7 +75,7 @@ app.post('/offline/message', async (req, res) => {
   const visitor = await prisma.visitor.create({ data: { name, email } });
   // Store as a closed session with an initial message
   const session = await prisma.chatSession.create({
-    data: { visitorId: visitor.id, issueType, status: 'CLOSED', closedReason: 'OFFLINE_MESSAGE' },
+    data: { visitorId: visitor.id, issueType, status: 'CLOSED', closedReason: 'OFFLINE_MESSAGE', closedAt: new Date() },
   });
   await prisma.message.create({
     data: { chatSessionId: session.id, role: 'USER', content: message },
@@ -172,6 +172,19 @@ io.on('connection', (socket) => {
   // Agent declares readiness to receive chats (joins agents room)
   socket.on('agent_ready', () => {
     socket.join(agentsRoom);
+  });
+
+  // Agent updates presence: join/leave agents room accordingly
+  socket.on('presence_update', (payload: { status: 'ONLINE' | 'OFFLINE' }) => {
+    try {
+      if (payload.status === 'ONLINE') {
+        socket.join(agentsRoom);
+      } else {
+        socket.leave(agentsRoom);
+      }
+    } catch (err) {
+      console.error('presence_update error', err);
+    }
   });
 
   // Visitor joins a session after pre-chat (passes sessionId and visitorId)
@@ -285,7 +298,7 @@ io.on('connection', (socket) => {
   // End a chat session
   socket.on('end_chat', async (payload: { sessionId: string }) => {
     try {
-      await prisma.chatSession.update({ where: { id: payload.sessionId }, data: { status: 'CLOSED' } });
+      await prisma.chatSession.update({ where: { id: payload.sessionId }, data: { status: 'CLOSED', closedAt: new Date() } });
       io.to(sessionRoom(payload.sessionId)).emit('chat_closed', { sessionId: payload.sessionId });
     } catch (err) {
       console.error('end_chat error', err);

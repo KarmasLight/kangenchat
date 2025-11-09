@@ -23,6 +23,7 @@ export default function CustomerWidget() {
   const sessionIdRef = useRef<string>('');
   const [showChat, setShowChat] = useState(false);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
+  const [isClosed, setIsClosed] = useState<boolean>(false);
 
   useEffect(() => {
     // Keep a ref of the current sessionId to avoid stale closures in socket handlers
@@ -39,10 +40,22 @@ export default function CustomerWidget() {
     };
 
     socket.on('connect', () => setStatus('Connected'));
+    socket.on('disconnect', (reason) => setStatus(`Disconnected: ${reason || 'unknown'}`));
+    socket.on('reconnect', () => {
+      setStatus('Reconnected');
+      // Rejoin session as visitor if we already have identifiers
+      const sId = sessionIdRef.current;
+      if (sId && visitorId) {
+        socket.emit('visitor_join', { sessionId: sId, visitorId }, () => {});
+      }
+    });
     socket.on('chat_started', (data: ChatEvent) => setSessionId(data.sessionId));
     socket.on('new_message', handleNewMessage);
     socket.on('agent_joined', () => setStatus('Agent has joined the chat'));
-    socket.on('chat_closed', () => setStatus('Chat has been closed'));
+    socket.on('chat_closed', () => {
+      setStatus('Chat has been closed');
+      setIsClosed(true);
+    });
     socket.on('user_typing', (data: { sessionId: string; role: 'USER' | 'AGENT' }) => {
       if (data.role === 'AGENT' && data.sessionId === sessionIdRef.current) {
         setIsAgentTyping(true);
@@ -59,6 +72,8 @@ export default function CustomerWidget() {
 
     return () => {
       socket.off('connect');
+      socket.off('disconnect');
+      socket.off('reconnect');
       socket.off('chat_started');
       socket.off('new_message', handleNewMessage);
       socket.off('agent_joined');
@@ -110,6 +125,7 @@ export default function CustomerWidget() {
     setSessionId(data.sessionId);
     setVisitorId(data.visitorId);
     setShowChat(true);
+    setIsClosed(false);
     // Connect socket and join session as visitor
     socket.connect();
     socket.emit('visitor_join', { sessionId: data.sessionId, visitorId: data.visitorId }, (resp: any) => {
@@ -132,14 +148,37 @@ export default function CustomerWidget() {
     }
   };
 
+  const exitChat = () => {
+    if (!sessionId) return;
+    socket.emit('end_chat', { sessionId });
+  };
+
+  const startNewChat = () => {
+    // Reset to pre-chat form
+    try { socket.disconnect(); } catch {}
+    setMessages([]);
+    setMessageInput('');
+    setSessionId('');
+    setVisitorId('');
+    setIsAgentTyping(false);
+    setIsClosed(false);
+    setStatus('Disconnected');
+    setShowChat(false);
+  };
+
   return (
     <div className="fixed bottom-4 right-4">
       {!showChat ? (
         <PreChatForm onSessionStarted={handleSessionStarted} />
       ) : (
         <Card className="w-96 h-128 flex flex-col">
-          <CardHeader>
-            <CardTitle>Live Support</CardTitle>
+          <CardHeader className="flex flex-col gap-1">
+            <div className="flex items-center justify-between">
+              <CardTitle>Live Support</CardTitle>
+              {sessionId && !isClosed && (
+                <Button variant="secondary" size="sm" onClick={exitChat}>Exit Chat</Button>
+              )}
+            </div>
             <p className="text-sm text-gray-500">{status}</p>
           </CardHeader>
           <CardContent className="flex-1 p-0">
@@ -160,7 +199,7 @@ export default function CustomerWidget() {
               {isAgentTyping && <p className="text-sm italic">Agent is typing...</p>}
             </ScrollArea>
           </CardContent>
-          {sessionId && (
+          {sessionId && !isClosed && (
             <CardFooter className="p-4 border-t">
               <div className="flex w-full space-x-2">
                 <Input
@@ -181,6 +220,12 @@ export default function CustomerWidget() {
                 />
                 <Button onClick={sendMessage}>Send</Button>
               </div>
+            </CardFooter>
+          )}
+          {sessionId && isClosed && (
+            <CardFooter className="p-4 border-t flex justify-between items-center">
+              <span className="text-sm text-muted-foreground">This chat has ended.</span>
+              <Button onClick={startNewChat} size="sm">Start New Chat</Button>
             </CardFooter>
           )}
         </Card>
