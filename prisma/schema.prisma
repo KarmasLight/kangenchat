@@ -1,0 +1,79 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Visitor {
+  id        String   @id @default(cuid())
+  name      String?
+  email     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  chatSessions ChatSession[]
+}
+
+model Agent {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  password  String // This will be a hashed password
+  displayName String? 
+  phone       String?
+  avatarUrl   String?
+  status      AgentStatus @default(ONLINE)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  chatSessions ChatSession[]
+  messages     Message[]
+}
+
+model ChatSession {
+  id        String   @id @default(cuid())
+  status    Status   @default(OPEN)
+  agentId   String?
+  visitorId String?
+  issueType String?
+  closedReason String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agent   Agent?  @relation(fields: [agentId], references: [id])
+  visitor Visitor?  @relation(fields: [visitorId], references: [id])
+  messages Message[]
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  content   String
+  role      Role
+  createdAt DateTime @default(now())
+
+  chatSessionId String
+  chatSession   ChatSession @relation(fields: [chatSessionId], references: [id])
+  agentId        String?
+  agent          Agent?      @relation(fields: [agentId], references: [id])
+}
+
+enum Status {
+  OPEN
+  CLOSED
+}
+
+enum Role {
+  USER
+  AGENT
+}
+
+enum AgentStatus {
+  ONLINE
+  OFFLINE
+}
