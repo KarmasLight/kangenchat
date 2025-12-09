@@ -29,11 +29,16 @@ model Agent {
   phone       String?
   avatarUrl   String?
   status      AgentStatus @default(ONLINE)
+  isAdmin     Boolean @default(false)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   chatSessions ChatSession[]
   messages     Message[]
+  agentDepartments AgentDepartment[]
+  assignments      SessionAssignment[]
+  offlineHandledSessions ChatSession[] @relation("OfflineHandler")
+  passwordResetTokens PasswordResetToken[]
 }
 
 model ChatSession {
@@ -44,12 +49,21 @@ model ChatSession {
   issueType String?
   closedReason String?
   closedAt  DateTime?
+  offlineHandledAt DateTime?
+  offlineHandledById String?
+  botConversationId String?
+  botMode           String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   agent   Agent?  @relation(fields: [agentId], references: [id])
   visitor Visitor?  @relation(fields: [visitorId], references: [id])
   messages Message[]
+  uploads  Upload[]
+  transcript Transcript?
+  assignments SessionAssignment[]
+  offlineHandledBy Agent? @relation("OfflineHandler", fields: [offlineHandledById], references: [id])
+  csatFeedback CsatFeedback?
 }
 
 model Message {
@@ -77,4 +91,92 @@ enum Role {
 enum AgentStatus {
   ONLINE
   OFFLINE
+}
+
+// Stores finalized transcript metadata/content for a session
+model Transcript {
+  id          String   @id @default(cuid())
+  sessionId   String   @unique
+  content     String?
+  emailedTo   String?
+  emailedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  session ChatSession @relation(fields: [sessionId], references: [id])
+}
+
+model CsatFeedback {
+  id         String   @id @default(cuid())
+  sessionId  String   @unique
+  rating     Int
+  comment    String?
+  createdAt  DateTime @default(now())
+
+  session ChatSession @relation(fields: [sessionId], references: [id])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  agentId   String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  agent Agent @relation(fields: [agentId], references: [id])
+}
+
+// File uploads associated with a session (S3-compatible storage)
+model Upload {
+  id           String   @id @default(cuid())
+  sessionId    String
+  fileUrl      String
+  mime         String?
+  size         Int?
+  uploadedAt   DateTime @default(now())
+
+  session ChatSession @relation(fields: [sessionId], references: [id])
+}
+
+// Departments for routing and assignment
+model Department {
+  id     String @id @default(cuid())
+  name   String @unique
+
+  agentDepartments AgentDepartment[]
+}
+
+// Agent to Department mapping
+model AgentDepartment {
+  id           String @id @default(cuid())
+  agentId      String
+  departmentId String
+
+  agent       Agent      @relation(fields: [agentId], references: [id])
+  department  Department @relation(fields: [departmentId], references: [id])
+}
+
+// Assignment history for sessions
+model SessionAssignment {
+  id         String   @id @default(cuid())
+  sessionId  String
+  agentId    String
+  assignedAt DateTime @default(now())
+
+  session ChatSession @relation(fields: [sessionId], references: [id])
+  agent   Agent       @relation(fields: [agentId], references: [id])
+}
+
+// Global mail / SMTP configuration editable from the admin dashboard
+model MailSettings {
+  id          String   @id @default("default")
+  host        String?
+  port        Int?
+  secure      Boolean? @default(false)
+  user        String?
+  password    String?
+  fromAddress String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 }

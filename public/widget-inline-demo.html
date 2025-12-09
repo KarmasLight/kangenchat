@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>KangenChat Inline Widget Demo</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        margin: 0;
+        padding: 2rem;
+        background: #f8fafc;
+        color: #0f172a;
+      }
+      .demo-shell {
+        max-width: 1200px;
+        margin: 0 auto;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 2rem;
+      }
+      .copy-block {
+        background: white;
+        border-radius: 16px;
+        border: 1px solid #e2e8f0;
+        padding: 1.5rem;
+        box-shadow: 0 10px 40px rgba(15, 23, 42, 0.05);
+      }
+      .chat-slot {
+        width: 100%;
+        height: 520px;
+        border-radius: 16px;
+        border: 1px solid #cbd5f5;
+        background: white;
+        overflow: hidden;
+      }
+      .chat-slot.inline {
+        grid-column: span 2;
+      }
+      code {
+        background: #0f172a;
+        color: #f8fafc;
+        padding: 0.15rem 0.35rem;
+        border-radius: 4px;
+      }
+    </style>
+    <script src="/kangenchat-embed.js" defer></script>
+  </head>
+  <body>
+    <main class="demo-shell">
+      <div class="copy-block">
+        <h1>Inline Embed Demo</h1>
+        <p>
+          This page shows how to mount the KangenChat widget inline. Change theme props or swap
+          between inline/floating modes by editing the snippet below, then reload.
+        </p>
+        <pre><code>window.KangenChat.init({
+  mode: 'inline',
+  containerId: 'inline-slot',
+  primaryColor: '#024F9E',
+  logoUrl: 'https://upload.wikimedia.org/wikipedia/commons/1/16/Enagic_logo.png',
+  welcomeTitle: 'Enagic Support',
+  welcomeSubtitle: 'Water experts are online'
+});</code></pre>
+      </div>
+      <div id="inline-slot" class="chat-slot"></div>
+    </main>
+
+    <script>
+      window.addEventListener('load', () => {
+        if (!window.KangenChat) {
+          console.warn('KangenChat embed script not loaded yet.');
+          return;
+        }
+        window.KangenChat.init({
+          mode: 'inline',
+          containerId: 'inline-slot',
+          primaryColor: '#024F9E',
+          logoUrl: 'https://upload.wikimedia.org/wikipedia/commons/1/16/Enagic_logo.png',
+          welcomeTitle: 'Enagic Support',
+          welcomeSubtitle: 'Water experts are online'
+        });
+      });
+    </script>
+  </body>
+</html>

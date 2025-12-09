@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -10,8 +10,10 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Loader2, MessageCircle, AlertCircle, CheckCircle } from 'lucide-react';
 
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5010';
+
 interface PreChatFormProps {
-  onSessionStarted?: (data: { sessionId: string; visitorId: string }) => void;
+  onSessionStarted: (data: { sessionId: string; visitorId: string; initialMessage?: string }) => void;
 }
 
 export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
@@ -23,30 +25,57 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
   const [submitted, setSubmitted] = useState<'chat' | 'offline' | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [agentsOnline, setAgentsOnline] = useState<boolean | null>(null);
+  const [agentsCount, setAgentsCount] = useState<number>(0);
+  const [checkingAgents, setCheckingAgents] = useState<boolean>(false);
+  const [lastCheckedAt, setLastCheckedAt] = useState<number | null>(null);
 
-  // Check if any agents are online on mount
-  React.useEffect(() => {
-    fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/agents/online`)
-      .then(r => r.json())
-      .then(({ online }) => setAgentsOnline(online))
-      .catch(() => setAgentsOnline(false));
+  const checkAgentsOnline = useCallback(async () => {
+    setCheckingAgents(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/agents/online`);
+      if (!res.ok) throw new Error('Failed');
+      const data = await res.json();
+      setAgentsOnline(Boolean(data?.online));
+      setAgentsCount(typeof data?.count === 'number' ? data.count : data?.online ? 1 : 0);
+      setLastCheckedAt(Date.now());
+    } catch {
+      setAgentsOnline(false);
+    } finally {
+      setCheckingAgents(false);
+    }
   }, []);
+
+  // Initial check and periodic polling
+  React.useEffect(() => {
+    checkAgentsOnline();
+    const id = window.setInterval(checkAgentsOnline, 15000);
+    return () => window.clearInterval(id);
+  }, [checkAgentsOnline]);
 
   const handleStartChat = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/sessions/start`, {
+      const res = await fetch(`${BACKEND_URL}/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, email, issueType }),
+        body: JSON.stringify({
+          name,
+          email,
+          issueType,
+          message: message.trim() || undefined,
+        }),
       });
       if (!res.ok) throw new Error('Failed to start session');
       const data = await res.json();
       setSubmitted('chat');
-      // Notify parent to transition to chat UI
-      onSessionStarted?.({ sessionId: data.sessionId, visitorId: data.visitorId });
+      onSessionStarted({
+        sessionId: data.session?.id ?? data.sessionId,
+        visitorId: data.visitorId,
+        initialMessage: message.trim() ? message.trim() : undefined,
+      });
+      setMessage('');
     } catch (err) {
       setError('Unable to start chat. Please try again.');
     } finally {
@@ -59,7 +88,7 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/offline/message`, {
+      const res = await fetch(`${BACKEND_URL}/offline/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, email, issueType, message }),
@@ -67,6 +96,7 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
       if (!res.ok) throw new Error('Failed to send offline message');
       const data = await res.json();
       setSubmitted('offline');
+      setMessage('');
     } catch (err) {
       setError('Unable to send message. Please try again.');
     } finally {
@@ -112,7 +142,12 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
           <CardDescription>We'll get back to you soon.</CardDescription>
         </CardHeader>
         <CardContent className="text-center">
-          <p className="text-sm text-muted-foreground">We've received your message and will respond as soon as possible.</p>
+          <p className="text-sm text-muted-foreground">
+            We've received your message and will respond as soon as possible.
+          </p>
+          <Button className="mt-4" variant="outline" onClick={() => { setSubmitted(null); checkAgentsOnline(); }}>
+            Send another message
+          </Button>
         </CardContent>
       </Card>
     );
@@ -127,9 +162,15 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
         </CardTitle>
         <CardDescription>
           {agentsOnline
-            ? 'Fill in your details to start a live chat with an agent.'
-            : 'Leave us a message and we\'ll get back to you.'}
+            ? `Fill in your details to start a live chat with one of our ${agentsCount || 1} available agent${(agentsCount || 1) > 1 ? 's' : ''}.`
+            : 'Leave us a message and we\'ll follow up as soon as an agent is available.'}
         </CardDescription>
+        <div className="mt-2 flex items-center justify-center gap-2 text-xs text-muted-foreground">
+          <span>{checkingAgents ? 'Checking availability…' : `Last checked ${lastCheckedAt ? new Date(lastCheckedAt).toLocaleTimeString() : 'just now'}`}</span>
+          <Button variant="ghost" size="sm" onClick={checkAgentsOnline} disabled={checkingAgents}>
+            {checkingAgents && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}Refresh
+          </Button>
+        </div>
       </CardHeader>
       <form onSubmit={agentsOnline ? handleStartChat : handleOfflineMessage}>
         <CardContent className="space-y-4">
@@ -172,20 +213,28 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
                 </SelectContent>
               </Select>
             </div>
-            {!agentsOnline && (
-              <div>
-                <Label htmlFor="message">Message</Label>
-                <Textarea
-                  id="message"
-                  placeholder="Describe your issue or question..."
-                  value={message}
-                  onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setMessage(e.target.value)}
-                  required
-                  disabled={loading}
-                  rows={4}
-                />
+            <div>
+              <Label htmlFor="message">How can we help?</Label>
+              <Textarea
+                id="message"
+                placeholder="Share the details so our team can jump in prepared."
+                value={message}
+                onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setMessage(e.target.value)}
+                required={!agentsOnline}
+                disabled={loading}
+                rows={agentsOnline ? 4 : 5}
+                maxLength={1000}
+                minLength={!agentsOnline ? 10 : undefined}
+              />
+              <div className="mt-1 flex justify-between text-[10px] text-muted-foreground">
+                <span>
+                  {agentsOnline
+                    ? 'Optional but helpful—agents will see this as soon as they join.'
+                    : 'Provide as much detail as possible so we can follow up quickly.'}
+                </span>
+                <span>{message.length}/1000</span>
               </div>
-            )}
+            </div>
           </div>
           {error && (
             <Alert variant="destructive">
@@ -196,7 +245,13 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
           )}
         </CardContent>
         <CardFooter>
-          <Button type="submit" className="w-full" disabled={loading}>
+          <Button
+            type="submit"
+            className="w-full"
+            disabled={
+              loading || (!agentsOnline && message.trim().length < 10)
+            }
+          >
             {loading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
             {agentsOnline ? 'Start Chat' : 'Send Message'}
           </Button>
