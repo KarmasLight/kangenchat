@@ -14,10 +14,12 @@ model Visitor {
   id        String   @id @default(cuid())
   name      String?
   email     String?
+  phone     String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   chatSessions ChatSession[]
+  messages     Message[]
 }
 
 model Agent {
@@ -29,7 +31,7 @@ model Agent {
   phone       String?
   avatarUrl   String?
   status      AgentStatus @default(ONLINE)
-  isAdmin     Boolean @default(false)
+  role        AgentRole   @default(AGENT)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -51,8 +53,15 @@ model ChatSession {
   closedAt  DateTime?
   offlineHandledAt DateTime?
   offlineHandledById String?
+  transferEnabled Boolean       @default(true)
   botConversationId String?
   botMode           String?
+  contactPhone String?
+  distributorId String?
+  handoffInfoRequestedAt DateTime?
+  handoffInfoProvidedAt DateTime?
+  initialEmailRequestedAt DateTime?
+  initialPhoneRequestedAt DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -74,8 +83,11 @@ model Message {
 
   chatSessionId String
   chatSession   ChatSession @relation(fields: [chatSessionId], references: [id])
-  agentId        String?
-  agent          Agent?      @relation(fields: [agentId], references: [id])
+  visitorId       String?
+  visitor         Visitor?      @relation(fields: [visitorId], references: [id])
+  agentId         String?
+  agent           Agent?        @relation(fields: [agentId], references: [id])
+  issueType       String?
 }
 
 enum Status {
@@ -91,6 +103,12 @@ enum Role {
 enum AgentStatus {
   ONLINE
   OFFLINE
+}
+
+enum AgentRole {
+  ADMIN
+  MANAGER
+  AGENT
 }
 
 // Stores finalized transcript metadata/content for a session
@@ -152,6 +170,7 @@ model AgentDepartment {
   id           String @id @default(cuid())
   agentId      String
   departmentId String
+  available    Boolean @default(false)
 
   agent       Agent      @relation(fields: [agentId], references: [id])
   department  Department @relation(fields: [departmentId], references: [id])
@@ -177,6 +196,8 @@ model MailSettings {
   user        String?
   password    String?
   fromAddress String?
+  transcriptIntro String?
+  integrationSecretHash String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }

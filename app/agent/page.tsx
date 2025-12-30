@@ -3,19 +3,71 @@ import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import type { ComponentType } from 'react';
 import { useRouter } from 'next/navigation';
 import { BACKEND_URL, getAgentSocket } from '@/lib/agentSocket';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Switch } from '@/components/ui/switch';
 import { Avatar, AvatarImage, AvatarFallback } from '@/components/ui/avatar';
-import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
-import { Search, Filter, Clock, Users, Inbox, Sparkles, Activity, AlertTriangle, CheckCircle2, Info, Loader2 } from 'lucide-react';
+import {
+  Search,
+  Filter,
+  Clock,
+  Users,
+  Inbox,
+  Sparkles,
+  Activity,
+  AlertTriangle,
+  CheckCircle2,
+  Info,
+  Loader2,
+  LayoutDashboard,
+  Mail,
+  Layers,
+  Settings,
+  Zap,
+  Shield,
+  Lock,
+  KeyRound,
+} from 'lucide-react';
 
 const PRIMARY_COLOR = '#024F9E'; // Enagic water-brand blue
+const MIN_AGENT_PASSWORD_LENGTH = 8;
+const ROLE_LABEL: Record<AgentRole, string> = {
+  ADMIN: 'Admin',
+  MANAGER: 'Manager',
+  AGENT: 'Agent',
+};
+
+type ShortcutItem = { id: string; title: string; text: string; createdAt: number };
+
+const DEFAULT_SHORTCUTS: ShortcutItem[] = [
+  {
+    id: 'greeting',
+    title: 'Greeting',
+    text: "Hi! Thanks for reaching out — how can I help today?",
+    createdAt: 0,
+  },
+  {
+    id: 'handoff',
+    title: 'Ask for details',
+    text: "To help quickly, can you share: 1) what you're trying to do, 2) what you expected, and 3) what happened instead?",
+    createdAt: 0,
+  },
+  {
+    id: 'closing',
+    title: 'Closing',
+    text: "Happy to help. If anything else comes up, just message us here anytime.",
+    createdAt: 0,
+  },
+];
+
+const MAIL_SECRET_HEADER = 'x-mail-secret-token';
 
 type ChatEvent = { sessionId: string; visitor?: { name?: string; email?: string }; issueType?: string; createdAt?: string };
 type EnrichedSession = { id: string; issueType?: string; status: string; createdAt?: string; visitor?: { id: string; name?: string; email?: string } };
@@ -49,7 +101,68 @@ type OfflineMessageApiItem = {
   messages?: Array<{ content: string; createdAt: string }>;
 };
 
+type AgentRole = 'ADMIN' | 'MANAGER' | 'AGENT';
+type InboxSessionListItem = {
+  id: string;
+  status: 'OPEN' | 'CLOSED';
+  issueType?: string | null;
+  closedReason?: string | null;
+  closedAt?: string | null;
+  offlineHandledAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  visitor?: { id: string; name?: string | null; email?: string | null } | null;
+  agent?: { id: string; name?: string | null; email?: string | null; displayName?: string | null } | null;
+  messages?: Array<{ content: string; role: 'USER' | 'AGENT'; createdAt: string }>;
+};
+
+type DepartmentAgent = {
+  id: string;
+  email: string;
+  name?: string | null;
+  displayName?: string | null;
+  status?: string | null;
+  available?: boolean;
+};
+
+type DepartmentApi = {
+  id: string;
+  name: string;
+  agentDepartments?: Array<{ id: string; available: boolean; agent: DepartmentAgent }>;
+};
+
+type AdminSection = 'departments' | 'agents' | 'email' | 'upcoming';
+type ActiveView =
+  | 'workspace'
+  | 'inbox'
+  | 'shortcuts'
+  | 'automations'
+  | 'csat'
+  | 'departments'
+  | 'settings'
+  | 'admin';
+
+type PrimaryNavItem = {
+  id: ActiveView;
+  label: string;
+  description: string;
+  icon: ComponentType<{ className?: string }>;
+  metric?: number;
+  accent: string;
+  disabled: boolean;
+};
+
 const socket = getAgentSocket();
+
+type AgentSummary = {
+  id: string;
+  email: string;
+  name?: string;
+  displayName?: string;
+  status?: string;
+  phone?: string;
+  role?: AgentRole;
+};
 
 export default function AgentDashboard() {
   const router = useRouter();
@@ -63,9 +176,7 @@ export default function AgentDashboard() {
   const [agentPhone, setAgentPhone] = useState<string>('');
   const [agentAvatarUrl, setAgentAvatarUrl] = useState<string>('');
   const [presenceOnline, setPresenceOnline] = useState<boolean>(false);
-  const [activeTab, setActiveTab] = useState<'chats' | 'offline' | 'profile' | 'admin'>('chats');
-  const [pwdCurrent, setPwdCurrent] = useState('');
-  const [pwdNew, setPwdNew] = useState('');
+  const [activeTab, setActiveTab] = useState<'chats' | 'offline' | 'profile'>('chats');
   const [selfAgentId, setSelfAgentId] = useState<string>('');
   const [availableChats, setAvailableChats] = useState<ChatEvent[]>([]);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
@@ -73,6 +184,8 @@ export default function AgentDashboard() {
   const [messageInput, setMessageInput] = useState('');
   const [isTyping, setIsTyping] = useState<{ role: 'USER' | 'AGENT' } | null>(null);
   const typingTimerRef = useRef<number | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
+  const didHydrateRef = useRef(false);
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [newChats, setNewChats] = useState<Record<string, boolean>>({});
   const [endedChats, setEndedChats] = useState<Record<string, boolean>>({});
@@ -91,46 +204,102 @@ export default function AgentDashboard() {
   const [isLoadingHistory, setIsLoadingHistory] = useState<boolean>(false);
   // Live time ticks
   const [listTick, setListTick] = useState<number>(0);
-  const [durationTick, setDurationTick] = useState<number>(0);
+  const [, setDurationTick] = useState<number>(0);
   const [selectedSessionCreatedAt, setSelectedSessionCreatedAt] = useState<string | undefined>(undefined);
   const [selectedSessionClosedAt, setSelectedSessionClosedAt] = useState<string | undefined>(undefined);
   const [selectedSessionAgent, setSelectedSessionAgent] = useState<{ id: string; name?: string; displayName?: string; email?: string } | null>(null);
-  const [agents, setAgents] = useState<Array<{ id: string; email: string; name?: string; displayName?: string; status?: string }>>([]);
+  const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [transferTargetAgentId, setTransferTargetAgentId] = useState<string>('');
-  const [hydrated, setHydrated] = useState<boolean>(false);
-  const [isAdmin, setIsAdmin] = useState<boolean>(false);
+  const [selfRole, setSelfRole] = useState<AgentRole>('AGENT');
+  const isAdmin = selfRole === 'ADMIN';
+  const isManager = selfRole === 'MANAGER';
   const [adminPwdMap, setAdminPwdMap] = useState<Record<string, string>>({});
   const [adminPwdBusy, setAdminPwdBusy] = useState<Record<string, boolean>>({});
   const [adminLogoutBusy, setAdminLogoutBusy] = useState<Record<string, boolean>>({});
+  const [adminDeleteBusy, setAdminDeleteBusy] = useState<Record<string, boolean>>({});
+  const [newAgentName, setNewAgentName] = useState<string>('');
+  const [newAgentDisplayName, setNewAgentDisplayName] = useState<string>('');
+  const [newAgentEmail, setNewAgentEmail] = useState<string>('');
+  const [newAgentPhone, setNewAgentPhone] = useState<string>('');
+  const [newAgentPassword, setNewAgentPassword] = useState<string>('');
+  const [newAgentRole, setNewAgentRole] = useState<AgentRole>('AGENT');
+  const [newAgentBusy, setNewAgentBusy] = useState<boolean>(false);
   const [mailHost, setMailHost] = useState<string>('');
   const [mailPort, setMailPort] = useState<string>('587');
   const [mailSecure, setMailSecure] = useState<boolean>(false);
   const [mailUser, setMailUser] = useState<string>('');
+  const [mailTranscriptIntro, setMailTranscriptIntro] = useState<string>('');
   const [mailPassword, setMailPassword] = useState<string>('');
   const [mailFrom, setMailFrom] = useState<string>('');
   const [mailLoading, setMailLoading] = useState<boolean>(false);
   const [mailSaving, setMailSaving] = useState<boolean>(false);
+  const [mailLocked, setMailLocked] = useState<boolean>(false);
+  const [mailRequiresSecret, setMailRequiresSecret] = useState<boolean>(false);
+  const [mailSecretToken, setMailSecretToken] = useState<string | null>(null);
+  const [showMailUnlockModal, setShowMailUnlockModal] = useState<boolean>(false);
+  const [mailUnlocking, setMailUnlocking] = useState<boolean>(false);
+  const [mailUnlockError, setMailUnlockError] = useState<string | null>(null);
+  const [mailUnlockSecret, setMailUnlockSecret] = useState<string>('');
+  const [showMailSecretModal, setShowMailSecretModal] = useState<boolean>(false);
+  const [mailSecretSaving, setMailSecretSaving] = useState<boolean>(false);
+  const [mailSecretNew, setMailSecretNew] = useState<string>('');
+  const [mailSecretCurrent, setMailSecretCurrent] = useState<string>('');
   const [showEmojiPickerAgent, setShowEmojiPickerAgent] = useState<boolean>(false);
   const [chatFilter, setChatFilter] = useState<'all' | 'mine' | 'unassigned' | 'new'>('all');
   const [chatSearch, setChatSearch] = useState<string>('');
   const [chatSort, setChatSort] = useState<'wait' | 'recent'>('wait');
   const [queueView, setQueueView] = useState<'waiting' | 'active' | 'closed'>('waiting');
-  const [departments, setDepartments] = useState<Array<{ id: string; name: string }>>([]);
-  const [joinedDepartments, setJoinedDepartments] = useState<string[]>([]);
+  const [departments, setDepartments] = useState<DepartmentApi[]>([]);
+  const [assignedDepartments, setAssignedDepartments] = useState<Record<string, boolean>>({});
   const [departmentBusyId, setDepartmentBusyId] = useState<string | null>(null);
   const [departmentsLoading, setDepartmentsLoading] = useState<boolean>(false);
-  const [issueTypeFilter, setIssueTypeFilter] = useState<string>('all');
+  const [newDepartmentName, setNewDepartmentName] = useState<string>('');
+  const [createDepartmentBusy, setCreateDepartmentBusy] = useState<boolean>(false);
+  const [departmentAssignSelection, setDepartmentAssignSelection] = useState<Record<string, string>>({});
+  const [departmentAdminBusyKey, setDepartmentAdminBusyKey] = useState<string | null>(null);
+  const [departmentEditName, setDepartmentEditName] = useState<Record<string, string>>({});
+  const [issueTypeFilter] = useState<string>('all');
+  const [activeView, setActiveView] = useState<ActiveView>('workspace');
+  const [adminSection, setAdminSection] = useState<'departments' | 'agents' | 'email' | 'upcoming'>('departments');
+  const [shortcuts, setShortcuts] = useState<ShortcutItem[]>(DEFAULT_SHORTCUTS);
+  const [shortcutSearch, setShortcutSearch] = useState<string>('');
+  const [shortcutTitle, setShortcutTitle] = useState<string>('');
+  const [shortcutText, setShortcutText] = useState<string>('');
+  const [toastNotification, setToastNotification] = useState<{ message: string; tone: 'success' | 'error' | 'info' } | null>(null);
+  const [inboxSessions, setInboxSessions] = useState<InboxSessionListItem[]>([]);
+  const [inboxLoading, setInboxLoading] = useState<boolean>(false);
+  const [inboxStatus, setInboxStatus] = useState<'all' | 'open' | 'closed'>('open');
+  const [inboxAssigned, setInboxAssigned] = useState<'all' | 'me' | 'unassigned' | 'assigned'>('unassigned');
+  const [inboxSearch, setInboxSearch] = useState<string>('');
+  const [takeNextBusy, setTakeNextBusy] = useState<boolean>(false);
 
-  const issueTypeOptions = [
-    { value: 'all', label: 'All issues' },
-    { value: 'general', label: 'General Inquiry' },
-    { value: 'technical', label: 'Technical Support' },
-    { value: 'billing', label: 'Billing' },
-    { value: 'feedback', label: 'Feedback' },
-  ];
+  const showToast = useCallback(
+    (message: string, tone: 'success' | 'error' | 'info' = 'info', duration = 2500) => {
+      setToastNotification({ message, tone });
+      if (toastTimerRef.current) {
+        window.clearTimeout(toastTimerRef.current);
+      }
+      toastTimerRef.current = window.setTimeout(() => {
+        setToastNotification(null);
+      }, duration) as unknown as number;
+    },
+    []
+  );
 
-  const onlineAgents = useMemo(() => agents.filter(a => (a.status || 'OFFLINE') === 'ONLINE'), [agents]);
-  const offlineAgents = useMemo(() => agents.filter(a => (a.status || 'OFFLINE') !== 'ONLINE'), [agents]);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const saved = window.sessionStorage.getItem('mail_secret_token');
+    if (saved) setMailSecretToken(saved);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (mailSecretToken) {
+      window.sessionStorage.setItem('mail_secret_token', mailSecretToken);
+    } else {
+      window.sessionStorage.removeItem('mail_secret_token');
+    }
+  }, [mailSecretToken]);
 
   const EMOJIS = ['😀','😃','😄','😁','😅','😂','😊','😍','🥰','😘','🤩','🤔','🤨','😎','😢','😭','😡','👍','👋','🙏','💧','💙','🎉'];
 
@@ -182,26 +351,183 @@ export default function AgentDashboard() {
     }
   };
 
-  const loadMailSettings = useCallback(async () => {
-    if (!token || !isAdmin) return;
-    setMailLoading(true);
+  const deleteAgent = async (agentId: string) => {
+    if (!token) return;
+    if (agentId === selfAgentId) {
+      setStatus('You cannot delete your own account');
+      return;
+    }
+    if (!window.confirm('Delete this agent? This cannot be undone.')) {
+      return;
+    }
+    setAdminDeleteBusy((prev) => ({ ...prev, [agentId]: true }));
+    setStatus('Deleting agent...');
     try {
-      const res = await fetch(`${BACKEND_URL}/admin/mail-settings`, {
+      const res = await fetch(`${BACKEND_URL}/admin/agents/${agentId}`, {
+        method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (!res.ok) return;
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setStatus(data?.error ? `Delete failed: ${data.error}` : 'Delete failed');
+        return;
+      }
+      setAgents((prev) => prev.filter((agent) => agent.id !== agentId));
+      setStatus('Agent deleted');
+    } catch {
+      setStatus('Delete failed');
+    } finally {
+      setAdminDeleteBusy((prev) => {
+        const next = { ...prev };
+        delete next[agentId];
+        return next;
+      });
+    }
+  };
+
+  const updateAgentRole = async (agentId: string, newRole: AgentRole) => {
+    if (!token) return;
+    setStatus('Updating role...');
+    try {
+      const res = await fetch(`${BACKEND_URL}/agents/${agentId}/role`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: newRole }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setStatus(data?.error ? `Role update failed: ${data.error}` : 'Role update failed');
+        return;
+      }
+      setStatus('Role updated');
+    } catch {
+      setStatus('Role update failed');
+    }
+  };
+
+  const loadMailSettings = useCallback(async (options?: { secretToken?: string | null }) => {
+    if (!token || !isAdmin) return;
+    setMailLoading(true);
+    setMailLocked(false);
+    try {
+      const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+      const effectiveSecret = options?.secretToken ?? mailSecretToken;
+      if (effectiveSecret) headers[MAIL_SECRET_HEADER] = effectiveSecret;
+      const res = await fetch(`${BACKEND_URL}/admin/mail-settings`, { headers });
+      if (res.status === 423) {
+        setMailLocked(true);
+        setMailRequiresSecret(true);
+        setShowMailUnlockModal(true);
+        return;
+      }
+      if (res.status === 401 && effectiveSecret) {
+        setMailSecretToken(null);
+        setMailLocked(true);
+        setShowMailUnlockModal(true);
+        return;
+      }
+      if (!res.ok) {
+        setStatus('Failed to load mail settings');
+        return;
+      }
       const data = await res.json();
+      setMailRequiresSecret(Boolean(data.requiresSecret));
+      if (effectiveSecret && !mailSecretToken) {
+        setMailSecretToken(effectiveSecret);
+      }
       setMailHost((data.host as string) || '');
       setMailPort(String(data.port ?? '587'));
       setMailSecure(Boolean(data.secure));
       setMailUser((data.user as string) || '');
       setMailFrom((data.fromAddress as string) || '');
+      setMailTranscriptIntro((data.transcriptIntro as string) || '');
     } catch {
       setStatus('Failed to load mail settings');
     } finally {
       setMailLoading(false);
     }
-  }, [token, isAdmin]);
+  }, [token, isAdmin, mailSecretToken]);
+
+  const unlockMailSettings = async () => {
+    if (!token || !mailUnlockSecret.trim()) {
+      setMailUnlockError('Integration password is required');
+      return;
+    }
+    setMailUnlocking(true);
+    setMailUnlockError(null);
+    try {
+      const res = await fetch(`${BACKEND_URL}/admin/mail-settings/unlock`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ secret: mailUnlockSecret.trim() }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setMailUnlockError(data?.error || 'Invalid integration password');
+        return;
+      }
+      const secretToken = (data?.token as string) || null;
+      setMailSecretToken(secretToken);
+      setShowMailUnlockModal(false);
+      setMailUnlockSecret('');
+      await loadMailSettings({ secretToken });
+      setStatus('Mail settings unlocked');
+    } catch {
+      setMailUnlockError('Unable to unlock settings, please try again');
+    } finally {
+      setMailUnlocking(false);
+    }
+  };
+
+  const saveIntegrationSecret = async () => {
+    if (!token) return;
+    if (mailSecretNew.trim().length < 8) {
+      setStatus('Integration password must be at least 8 characters');
+      return;
+    }
+    setMailSecretSaving(true);
+    setStatus('Saving integration password...');
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      };
+      if (mailSecretToken) headers[MAIL_SECRET_HEADER] = mailSecretToken;
+      const res = await fetch(`${BACKEND_URL}/admin/mail-settings/secret`, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify({
+          secret: mailSecretNew.trim(),
+          currentSecret: mailSecretCurrent.trim() ? mailSecretCurrent.trim() : undefined,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.status === 423) {
+        setMailLocked(true);
+        setShowMailUnlockModal(true);
+        return;
+      }
+      if (res.status === 401 && mailSecretToken) {
+        setMailSecretToken(null);
+        setMailLocked(true);
+        setShowMailUnlockModal(true);
+        return;
+      }
+      if (!res.ok) {
+        setStatus(data?.error ? `Failed to save integration password: ${data.error}` : 'Failed to save integration password');
+        return;
+      }
+      setMailRequiresSecret(true);
+      setShowMailSecretModal(false);
+      setMailSecretCurrent('');
+      setMailSecretNew('');
+      setStatus('Integration password saved');
+    } catch {
+      setStatus('Failed to save integration password');
+    } finally {
+      setMailSecretSaving(false);
+    }
+  };
 
   const saveMailSettings = async () => {
     if (!token || !isAdmin) return;
@@ -215,17 +541,36 @@ export default function AgentDashboard() {
         user: mailUser || null,
         password: mailPassword || undefined,
         fromAddress: mailFrom || null,
+        transcriptIntro: mailTranscriptIntro || null,
       };
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      };
+      if (mailSecretToken) headers[MAIL_SECRET_HEADER] = mailSecretToken;
       const res = await fetch(`${BACKEND_URL}/admin/mail-settings`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers,
         body: JSON.stringify(payload),
       });
       const data = await res.json().catch(() => null);
+      if (res.status === 423) {
+        setMailLocked(true);
+        setMailRequiresSecret(true);
+        setShowMailUnlockModal(true);
+        return;
+      }
+      if (res.status === 401 && mailSecretToken) {
+        setMailSecretToken(null);
+        setMailLocked(true);
+        setShowMailUnlockModal(true);
+        return;
+      }
       if (!res.ok) {
         setStatus(data?.error ? `Failed to save mail settings: ${data.error}` : 'Failed to save mail settings');
         return;
       }
+      setMailRequiresSecret(Boolean(data?.requiresSecret));
       setStatus('Mail settings saved');
       setMailPassword('');
     } catch {
@@ -291,12 +636,8 @@ export default function AgentDashboard() {
   const activeCount = activeChats.length;
   const closedCount = closedChats.length;
 
-  const newWaitingCount = useMemo(
-    () => waitingChats.filter(c => newChats[c.sessionId]).length,
-    [waitingChats, newChats]
-  );
-
   const longestWaitMinutes = useMemo(() => {
+    void listTick;
     let longest = 0;
     waitingChats.forEach(chat => {
       const wait = computeWaitMinutes(chat.createdAt) ?? 0;
@@ -312,6 +653,7 @@ export default function AgentDashboard() {
 
   const filteredOpenChats = useMemo(() => {
     const search = chatSearch.trim().toLowerCase();
+    void listTick;
 
     const byFilter = openChats.filter(chat => {
       const assignee = assignedAgents[chat.sessionId]?.id;
@@ -353,7 +695,7 @@ export default function AgentDashboard() {
         return b.waitMinutes - a.waitMinutes;
       })
       .map(entry => entry.chat);
-  }, [openChats, assignedAgents, chatFilter, chatSearch, chatSort, selfAgentId, newChats, listTick]);
+  }, [openChats, assignedAgents, chatFilter, chatSearch, chatSort, selfAgentId, newChats, issueTypeFilter, listTick]);
 
   const filteredQueueChats = useMemo(() => {
     if (queueView === 'closed') {
@@ -383,13 +725,71 @@ export default function AgentDashboard() {
     return target;
   }, [waitingChats]);
 
-  const [csatStats, setCsatStats] = useState<{ average: number | null; total: number; positive: number } | null>(null);
+  type CsatTrendPoint = { date: string; average: number | null; responses: number };
+  type CsatAnalytics = {
+    average: number | null;
+    total: number;
+    positive: number;
+    distribution: Record<number, number>;
+    trend: CsatTrendPoint[];
+    period: { days: number; responses: number };
+    agentChatCounts: { agentId: string; name: string; chatsHandled: number }[];
+    agentWindowDays: number;
+    averageWaitMinutes: number | null;
+    averageQueueSize: number | null;
+  };
+
+  const [csatStats, setCsatStats] = useState<CsatAnalytics | null>(null);
+  const [csatRefreshing, setCsatRefreshing] = useState(false);
   const csatScore = useMemo(() => {
     if (!csatStats || csatStats.average === null || csatStats.average === undefined) return null;
     const percent = (csatStats.average / 5) * 100;
     return Math.min(100, Math.max(0, Math.round(percent * 10) / 10));
   }, [csatStats]);
+  const csatDistribution = useMemo(() => csatStats?.distribution ?? null, [csatStats]);
+  const csatTrend = useMemo(() => csatStats?.trend ?? [], [csatStats]);
+  const csatTrendMaxResponses = useMemo(() => {
+    if (!csatTrend.length) return 0;
+    return Math.max(...csatTrend.map((point) => point.responses));
+  }, [csatTrend]);
+  const agentChatCounts = useMemo(() => csatStats?.agentChatCounts ?? [], [csatStats]);
+  const positiveRate = useMemo(() => {
+    if (!csatStats || !csatStats.total) return null;
+    return Math.round((csatStats.positive / csatStats.total) * 100);
+  }, [csatStats]);
+  const csatDistributionEntries = useMemo(() => {
+    const entries: Array<{ rating: number; value: number; percent: number }> = [];
+    if (!csatDistribution || !csatStats?.total) return entries;
+    for (let rating = 5; rating >= 1; rating -= 1) {
+      const value = csatDistribution[rating] ?? 0;
+      const percent = csatStats.total ? Math.round((value / csatStats.total) * 100) : 0;
+      entries.push({ rating, value, percent });
+    }
+    return entries;
+  }, [csatDistribution, csatStats]);
+  const csatPeriodDays = csatStats?.period?.days ?? 14;
+  const csatPeriodResponses = csatStats?.period?.responses ?? csatStats?.total ?? 0;
+  const displayedAgentChatCounts = useMemo(() => agentChatCounts.slice(0, 5), [agentChatCounts]);
+  const averageWaitLabel = useMemo(() => {
+    if (csatStats?.averageWaitMinutes === null || csatStats?.averageWaitMinutes === undefined) return '—';
+    const minutes = csatStats.averageWaitMinutes;
+    if (minutes < 1) {
+      return `${Math.round(minutes * 60)} sec`;
+    }
+    if (minutes >= 60) {
+      const hours = minutes / 60;
+      return `${hours.toFixed(1)} hr`;
+    }
+    return `${minutes.toFixed(1)} min`;
+  }, [csatStats]);
+  const averageQueueLabel = useMemo(() => {
+    if (csatStats?.averageQueueSize === null || csatStats?.averageQueueSize === undefined) return '—';
+    return csatStats.averageQueueSize.toFixed(1);
+  }, [csatStats]);
   const filteredQueueCount = filteredQueueChats.length;
+  const onlineAgents = useMemo(() => {
+    return agents.filter((agent) => (agent.status ?? '').toUpperCase() === 'ONLINE');
+  }, [agents]);
 
   type BadgeMeta = { label: string; icon: ComponentType<{ className?: string }>; toneClass: string };
   type OverviewStat = { label: string; value: string; icon: ComponentType<{ className?: string }>; toneClass: string };
@@ -461,42 +861,220 @@ export default function AgentDashboard() {
     ];
   }, [openChatCount, myOpenChatCount, newOpenChatCount, longestWaitMinutes]);
 
-  const StatusIcon = statusBadgeMeta.icon;
-  const PresenceIcon = presenceBadgeMeta.icon;
   const longestWaitSummary = openChatCount > 0 ? `${longestWaitMinutes} min` : '—';
   const agentIdentityLabel = agentDisplayName || name || 'Agent';
 
-  const refreshOfflineMessages = useCallback(async () => {
-    if (!token) return;
+  const primaryNavItems = useMemo<PrimaryNavItem[]>(() => {
+    const coreItems: PrimaryNavItem[] = [
+      {
+        id: 'workspace' as const,
+        label: 'Live Workspace',
+        description: 'Queues & chats',
+        icon: LayoutDashboard,
+        metric: openChatCount,
+        accent: 'from-sky-500/15 via-sky-500/10 to-transparent',
+        disabled: false,
+      },
+      {
+        id: 'inbox' as const,
+        label: 'Visitor Inbox',
+        description: 'Follow ups & CRM',
+        icon: Mail,
+        metric: offlinePendingCount,
+        accent: 'from-rose-500/15 via-rose-500/10 to-transparent',
+        disabled: false,
+      },
+      {
+        id: 'shortcuts' as const,
+        label: 'Shortcuts',
+        description: 'Canned replies',
+        icon: Zap,
+        metric: shortcuts.length,
+        accent: 'from-indigo-500/15 via-indigo-500/10 to-transparent',
+        disabled: false,
+      },
+    ];
+
+    if (!isAdmin) return coreItems;
+
+    const adminItems: PrimaryNavItem[] = [
+      ...coreItems,
+      {
+        id: 'automations' as const,
+        label: 'Automations',
+        description: 'Playbooks & flows',
+        icon: Layers,
+        metric: 0,
+        accent: 'from-amber-500/15 via-amber-500/10 to-transparent',
+        disabled: false,
+      },
+      {
+        id: 'csat' as const,
+        label: 'CSAT',
+        description: 'Customer satisfaction',
+        icon: Sparkles,
+        metric: csatScore === null ? 0 : Math.round(csatScore),
+        accent: 'from-sky-500/15 via-sky-500/10 to-transparent',
+        disabled: false,
+      },
+      {
+        id: 'departments' as const,
+        label: 'Departments',
+        description: 'Routing & assignment',
+        icon: Users,
+        metric: departments.length,
+        accent: 'from-emerald-500/15 via-emerald-500/10 to-transparent',
+        disabled: false,
+      },
+      {
+        id: 'settings' as const,
+        label: 'Org Settings',
+        description: 'Branding & teams',
+        icon: Settings,
+        metric: undefined,
+        accent: 'from-purple-500/15 via-purple-500/10 to-transparent',
+        disabled: false,
+      },
+    ];
+
+    if (isAdmin) {
+      adminItems.push({
+        id: 'admin' as const,
+        label: 'Admin Tools',
+        description: 'Agents & email',
+        icon: Shield,
+        metric: agents.length,
+        accent: 'from-slate-900/15 via-slate-800/10 to-transparent',
+        disabled: false,
+      });
+    }
+
+    return adminItems;
+  }, [openChatCount, offlinePendingCount, isAdmin, shortcuts.length, departments.length, csatScore]);
+
+  const adminNavItems = useMemo(
+    () => [
+      {
+        id: 'departments' as AdminSection,
+        label: 'Departments',
+        description: 'Routing & assignment',
+        metric: departments.length,
+      },
+      {
+        id: 'agents' as AdminSection,
+        label: 'Agents',
+        description: 'Passwords & availability',
+        metric: agents.length,
+      },
+      {
+        id: 'email' as AdminSection,
+        label: 'Email settings',
+        description: 'SMTP & alerts',
+        metric: mailHost ? 1 : 0,
+      },
+      {
+        id: 'upcoming' as AdminSection,
+        label: 'Upcoming tools',
+        description: 'More admin utilities',
+        metric: undefined,
+      },
+    ],
+    [departments.length, agents.length, mailHost]
+  );
+
+  useEffect(() => {
+    if (
+      !isAdmin &&
+      (activeView === 'departments' || activeView === 'settings' || activeView === 'automations' || activeView === 'csat' || activeView === 'admin')
+    ) {
+      setActiveView('workspace');
+    }
+  }, [isAdmin, activeView]);
+
+  useEffect(() => {
+    if (activeView !== 'admin' && adminSection !== 'departments') {
+      setAdminSection('departments');
+    }
+  }, [activeView, adminSection]);
+
+  const refreshCsat = useCallback(async (): Promise<boolean> => {
+    if (!token) return false;
+    try {
+      const res = await fetch(`${BACKEND_URL}/analytics/csat`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const payload = await res.json().catch(() => null);
+      if (!res.ok || !payload) {
+        setCsatStats(null);
+        return false;
+      }
+      const emptyDistribution: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+      setCsatStats({
+        average: payload.average ?? null,
+        total: payload.total ?? 0,
+        positive: payload.positive ?? 0,
+        distribution: payload.distribution ?? emptyDistribution,
+        trend: Array.isArray(payload.trend) ? payload.trend : [],
+        period: payload.period ?? { days: 14, responses: 0 },
+        agentChatCounts: Array.isArray(payload.agentChatCounts) ? payload.agentChatCounts : [],
+        agentWindowDays: payload.agentWindowDays ?? 30,
+        averageWaitMinutes: payload.averageWaitMinutes ?? null,
+        averageQueueSize: payload.averageQueueSize ?? null,
+      });
+      return true;
+    } catch (err) {
+      console.error('refresh csat error', err);
+      setCsatStats(null);
+      return false;
+    }
+  }, [token]);
+
+  const handleCsatRefresh = useCallback(async () => {
+    if (!token || csatRefreshing) return;
+    setCsatRefreshing(true);
+    const ok = await refreshCsat();
+    if (!ok) {
+      setStatus('Failed to refresh CSAT data');
+    }
+    setCsatRefreshing(false);
+  }, [token, refreshCsat, csatRefreshing, setStatus]);
+
+  const StatusIcon = statusBadgeMeta.icon;
+  const PresenceIcon = presenceBadgeMeta.icon;
+
+  const refreshOfflineMessages = useCallback(async (tokenOverride?: string) => {
+    const authToken = tokenOverride || token;
+    if (!authToken) return;
     setOfflineLoading(true);
     try {
       const res = await fetch(`${BACKEND_URL}/offline/messages`, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: `Bearer ${authToken}` },
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data)) {
-          const mapped: OfflineMessage[] = data.map((item: OfflineMessageApiItem) => ({
-            id: item.id,
-            issueType: item.issueType,
-            createdAt: item.createdAt,
-            visitor: item.visitor,
-            offlineHandledAt: item.offlineHandledAt,
-            offlineHandledBy: item.offlineHandledBy,
-            messagePreview: item.messages?.[0]?.content,
-            messageCreatedAt: item.messages?.[0]?.createdAt,
-          }));
-          setOfflineMessages(mapped);
-        } else {
-          setOfflineMessages([]);
-        }
+      if (!res.ok) {
+        setOfflineMessages([]);
+        setStatus('Failed to load offline messages');
+        return;
       }
+      const payload = (await res.json().catch(() => [])) as unknown;
+      const items: OfflineMessageApiItem[] = Array.isArray(payload) ? (payload as OfflineMessageApiItem[]) : [];
+      const mapped: OfflineMessage[] = items.map((item) => ({
+        id: item.id,
+        issueType: item.issueType,
+        createdAt: item.createdAt,
+        visitor: item.visitor,
+        offlineHandledAt: item.offlineHandledAt,
+        offlineHandledBy: item.offlineHandledBy,
+        messagePreview: item.messages?.[0]?.content,
+        messageCreatedAt: item.messages?.[0]?.createdAt,
+      }));
+      setOfflineMessages(mapped);
     } catch {
+      setOfflineMessages([]);
       setStatus('Failed to load offline messages');
     } finally {
       setOfflineLoading(false);
     }
-  }, [token, setStatus]);
+  }, [token]);
 
   const loadDepartments = useCallback(async () => {
     if (!token) return;
@@ -506,9 +1084,17 @@ export default function AgentDashboard() {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        console.warn('load departments failed', res.status, body);
-        setStatus('Failed to load departments');
+        const rawBody = await res.text().catch(() => '');
+        console.warn('load departments failed', res.status, rawBody);
+        let detail: string | undefined;
+        try {
+          const parsed = JSON.parse(rawBody) as { error?: string };
+          if (parsed?.error) detail = parsed.error;
+        } catch {
+          if (rawBody) detail = rawBody;
+        }
+        setDepartments([]);
+        setStatus(detail ? `Failed to load departments: ${detail}` : `Failed to load departments (${res.status})`);
         return;
       }
       const data = await res.json();
@@ -517,25 +1103,201 @@ export default function AgentDashboard() {
       }
     } catch (err) {
       console.error('load departments error', err);
+      setDepartments([]);
       setStatus('Failed to load departments');
     } finally {
       setDepartmentsLoading(false);
     }
   }, [token]);
 
-  const refreshJoinedDepartments = useCallback(async () => {
+  const createDepartment = useCallback(async () => {
+    if (!token) return;
+    const name = newDepartmentName.trim();
+    if (!name) return;
+    setCreateDepartmentBusy(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/departments`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ name }),
+      });
+      const payload = await res.json().catch(() => null);
+      if (!res.ok) {
+        setStatus(payload?.error ? `Failed to create department: ${payload.error}` : 'Failed to create department');
+        return;
+      }
+      setNewDepartmentName('');
+      await loadDepartments();
+    } catch (err) {
+      console.error('create department error', err);
+      setStatus('Failed to create department');
+    } finally {
+      setCreateDepartmentBusy(false);
+    }
+  }, [token, newDepartmentName, loadDepartments]);
+
+  const assignAgentToDepartment = useCallback(
+    async (departmentId: string, agentId: string) => {
+      if (!token) return;
+      if (!departmentId || !agentId) return;
+      const key = `${departmentId}:assign`;
+      setDepartmentAdminBusyKey(key);
+      try {
+        const res = await fetch(`${BACKEND_URL}/departments/${departmentId}/agents`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ agentId }),
+        });
+        const payload = await res.json().catch(() => null);
+        if (!res.ok) {
+          setStatus(payload?.error ? `Failed to assign agent: ${payload.error}` : 'Failed to assign agent');
+          return;
+        }
+        setDepartmentAssignSelection((prev) => {
+          const next = { ...prev };
+          delete next[departmentId];
+          return next;
+        });
+        await loadDepartments();
+      } catch (err) {
+        console.error('assign agent to department error', err);
+        setStatus('Failed to assign agent');
+      } finally {
+        setDepartmentAdminBusyKey(null);
+      }
+    },
+    [token, loadDepartments]
+  );
+
+  const renameDepartment = useCallback(
+    async (departmentId: string) => {
+      if (!token) return;
+      const name = (departmentEditName[departmentId] ?? '').trim();
+      if (!name) return;
+      const key = `${departmentId}:rename`;
+      setDepartmentAdminBusyKey(key);
+      try {
+        const res = await fetch(`${BACKEND_URL}/departments/${departmentId}`, {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ name }),
+        });
+        const payload = await res.json().catch(() => null);
+        if (!res.ok) {
+          setStatus(payload?.error ? `Failed to rename department: ${payload.error}` : 'Failed to rename department');
+          return;
+        }
+        setDepartmentEditName((prev) => {
+          const next = { ...prev };
+          delete next[departmentId];
+          return next;
+        });
+        await loadDepartments();
+      } catch (err) {
+        console.error('rename department error', err);
+        setStatus('Failed to rename department');
+      } finally {
+        setDepartmentAdminBusyKey(null);
+      }
+    },
+    [token, departmentEditName, loadDepartments]
+  );
+
+  const deleteDepartment = useCallback(
+    async (departmentId: string) => {
+      if (!token) return;
+      const confirmed = typeof window !== 'undefined' ? window.confirm('Delete this department?') : false;
+      if (!confirmed) return;
+      const key = `${departmentId}:delete`;
+      setDepartmentAdminBusyKey(key);
+      try {
+        const res = await fetch(`${BACKEND_URL}/departments/${departmentId}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const payload = await res.json().catch(() => null);
+        if (!res.ok) {
+          setStatus(payload?.error ? `Failed to delete department: ${payload.error}` : 'Failed to delete department');
+          return;
+        }
+        setDepartmentEditName((prev) => {
+          const next = { ...prev };
+          delete next[departmentId];
+          return next;
+        });
+        await loadDepartments();
+      } catch (err) {
+        console.error('delete department error', err);
+        setStatus('Failed to delete department');
+      } finally {
+        setDepartmentAdminBusyKey(null);
+      }
+    },
+    [token, loadDepartments]
+  );
+
+  const unassignAgentFromDepartment = useCallback(
+    async (departmentId: string, agentId: string) => {
+      if (!token) return;
+      if (!departmentId || !agentId) return;
+      const key = `${departmentId}:${agentId}:remove`;
+      setDepartmentAdminBusyKey(key);
+      try {
+        const res = await fetch(`${BACKEND_URL}/departments/${departmentId}/agents/${agentId}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const payload = await res.json().catch(() => null);
+        if (!res.ok) {
+          setStatus(payload?.error ? `Failed to unassign agent: ${payload.error}` : 'Failed to unassign agent');
+          return;
+        }
+        await loadDepartments();
+      } catch (err) {
+        console.error('unassign agent from department error', err);
+        setStatus('Failed to unassign agent');
+      } finally {
+        setDepartmentAdminBusyKey(null);
+      }
+    },
+    [token, loadDepartments]
+  );
+
+  const refreshAssignedDepartments = useCallback(async () => {
     if (!token) return;
     try {
       const res = await fetch(`${BACKEND_URL}/me/departments`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (!res.ok) throw new Error('Failed to load joined departments');
+      if (!res.ok) {
+        console.warn('refresh assigned departments failed', res.status);
+        setAssignedDepartments({});
+        return;
+      }
       const data = await res.json();
       if (Array.isArray(data)) {
-        setJoinedDepartments(data.map((item: { id: string }) => item.id));
+        const mapped = data.reduce<Record<string, boolean>>((acc, item) => {
+          if (item && typeof item.id === 'string') {
+            acc[item.id] = Boolean(item.available);
+          }
+          return acc;
+        }, {});
+        setAssignedDepartments(mapped);
+      } else {
+        setAssignedDepartments({});
       }
     } catch (err) {
-      console.error('refresh joined departments error', err);
+      console.error('refresh assigned departments error', err);
+      setAssignedDepartments({});
     }
   }, [token]);
 
@@ -548,13 +1310,19 @@ export default function AgentDashboard() {
           method: join ? 'POST' : 'DELETE',
           headers: { Authorization: `Bearer ${token}` },
         });
-        if (!res.ok) throw new Error('Department request failed');
-        setJoinedDepartments((prev) => {
-          if (join) {
-            return prev.includes(departmentId) ? prev : [...prev, departmentId];
-          }
-          return prev.filter((id) => id !== departmentId);
-        });
+        const payload = await res.json().catch(() => null);
+        if (!res.ok) {
+          const message =
+            typeof payload?.error === 'string' && payload.error.trim().length > 0
+              ? payload.error
+              : 'Department request failed';
+          setStatus(message);
+          return;
+        }
+        setAssignedDepartments((prev) => ({
+          ...prev,
+          [departmentId]: join,
+        }));
       } catch (err) {
         console.error('update department membership error', err);
         setStatus('Failed to update department availability');
@@ -567,8 +1335,194 @@ export default function AgentDashboard() {
 
   useEffect(() => {
     loadDepartments();
-    refreshJoinedDepartments();
-  }, [loadDepartments, refreshJoinedDepartments]);
+    refreshAssignedDepartments();
+  }, [loadDepartments, refreshAssignedDepartments]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const raw = window.localStorage.getItem('agent_shortcuts');
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) return;
+      const next: ShortcutItem[] = parsed
+        .filter((item): item is ShortcutItem =>
+          Boolean(item && typeof item === 'object' && 'id' in item && 'title' in item && 'text' in item)
+        )
+        .map((item) => ({
+          id: String(item.id),
+          title: String(item.title),
+          text: String(item.text),
+          createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
+        }));
+      if (next.length > 0) setShortcuts(next);
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem('agent_shortcuts', JSON.stringify(shortcuts));
+    } catch {}
+  }, [shortcuts]);
+
+  const filteredShortcuts = useMemo(() => {
+    const q = shortcutSearch.trim().toLowerCase();
+    if (!q) return shortcuts;
+    return shortcuts.filter((s) => {
+      const composite = `${s.title} ${s.text}`.toLowerCase();
+      return composite.includes(q);
+    });
+  }, [shortcuts, shortcutSearch]);
+
+  const applyShortcut = useCallback((text: string) => {
+    setMessageInput((prev) => (prev ? `${prev}\n\n${text}` : text));
+    setActiveView('workspace');
+    setActiveTab('chats');
+  }, []);
+
+  const copyShortcut = useCallback(async (text: string) => {
+    const fallbackCopy = () => {
+      try {
+        if (typeof document === 'undefined') return false;
+        const el = document.createElement('textarea');
+        el.value = text;
+        el.setAttribute('readonly', '');
+        el.style.position = 'fixed';
+        el.style.left = '-9999px';
+        el.style.top = '0';
+        document.body.appendChild(el);
+        el.select();
+        el.setSelectionRange(0, el.value.length);
+        const ok = document.execCommand('copy');
+        document.body.removeChild(el);
+        return ok;
+      } catch {
+        return false;
+      }
+    };
+
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text);
+        setStatus('Copied shortcut');
+        showToast('Copied shortcut', 'success');
+        return;
+      }
+    } catch {
+      // fall through to fallback
+    }
+
+    const ok = fallbackCopy();
+    setStatus(ok ? 'Copied shortcut' : 'Copy failed');
+    showToast(ok ? 'Copied shortcut' : 'Copy failed', ok ? 'success' : 'error');
+  }, [showToast]);
+
+  const addShortcut = useCallback(() => {
+    const title = shortcutTitle.trim();
+    const text = shortcutText.trim();
+    if (!title || !text) return;
+    const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setShortcuts((prev) => [{ id, title, text, createdAt: Date.now() }, ...prev]);
+    setShortcutTitle('');
+    setShortcutText('');
+    setStatus('Shortcut added');
+    showToast('Shortcut added', 'success');
+  }, [shortcutText, shortcutTitle, showToast]);
+
+  const deleteShortcut = useCallback((id: string) => {
+    setShortcuts((prev) => prev.filter((s) => s.id !== id));
+    setStatus('Shortcut removed');
+    showToast('Shortcut removed', 'info');
+  }, [showToast]);
+
+  const createAgent = async () => {
+    if (!token || !isAdmin) return;
+    const name = newAgentName.trim();
+    const email = newAgentEmail.trim();
+    const password = newAgentPassword.trim();
+    if (!name || !email || password.length < MIN_AGENT_PASSWORD_LENGTH) {
+      setStatus(`Name, email, and password (>=${MIN_AGENT_PASSWORD_LENGTH} chars) are required`);
+      showToast(`Fill name, email, password ≥ ${MIN_AGENT_PASSWORD_LENGTH} chars`, 'error');
+      return;
+    }
+    setNewAgentBusy(true);
+    setStatus('Creating agent...');
+    try {
+      const res = await fetch(`${BACKEND_URL}/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          name,
+          displayName: newAgentDisplayName.trim() || undefined,
+          email,
+          phone: newAgentPhone.trim() || undefined,
+          password,
+          role: newAgentRole,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.agent) {
+        const detail = data?.error || 'Failed to create agent';
+        setStatus(detail);
+        showToast(detail, 'error');
+        return;
+      }
+      setAgents((prev) => [data.agent, ...prev]);
+      setStatus('Agent created');
+      showToast('Agent created', 'success');
+      setNewAgentName('');
+      setNewAgentDisplayName('');
+      setNewAgentEmail('');
+      setNewAgentPhone('');
+      setNewAgentPassword('');
+      setNewAgentRole('AGENT');
+    } catch {
+      setStatus('Failed to create agent');
+      showToast('Failed to create agent', 'error');
+    } finally {
+      setNewAgentBusy(false);
+    }
+  };
+
+  const loadInbox = useCallback(async () => {
+    if (!token) return;
+    setInboxLoading(true);
+    try {
+      const qs = new URLSearchParams();
+      if (inboxStatus === 'open') qs.set('status', 'OPEN');
+      if (inboxStatus === 'closed') qs.set('status', 'CLOSED');
+      if (inboxAssigned !== 'all') qs.set('assigned', inboxAssigned);
+      if (inboxSearch.trim()) qs.set('q', inboxSearch.trim());
+      qs.set('take', '75');
+
+      const res = await fetch(`${BACKEND_URL}/sessions?${qs.toString()}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const payload = await res.json().catch(() => null);
+      if (!res.ok) {
+        setStatus(payload?.error ? `Inbox load failed: ${payload.error}` : 'Inbox load failed');
+        setInboxSessions([]);
+        return;
+      }
+      const sessions = Array.isArray(payload?.sessions) ? (payload.sessions as InboxSessionListItem[]) : [];
+      setInboxSessions(sessions);
+    } catch {
+      setStatus('Inbox load failed');
+      setInboxSessions([]);
+    } finally {
+      setInboxLoading(false);
+    }
+  }, [token, inboxAssigned, inboxSearch, inboxStatus]);
+
+  useEffect(() => {
+    if (activeView !== 'inbox') return;
+    if (!token) return;
+    const handle = window.setTimeout(() => {
+      loadInbox();
+    }, 200);
+    return () => window.clearTimeout(handle);
+  }, [activeView, token, inboxStatus, inboxAssigned, inboxSearch, loadInbox]);
 
   const markOfflineHandled = useCallback(async (sessionId: string) => {
     if (!token) return;
@@ -603,12 +1557,13 @@ export default function AgentDashboard() {
     }
   }, [token]);
 
-  const handleLogout = async (options?: { reason?: string }) => {
+  const handleLogout = useCallback(async (options?: { reason?: string }) => {
+    const authToken = token;
     try {
-      if (token) {
+      if (authToken) {
         await fetch(`${BACKEND_URL}/presence`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
           body: JSON.stringify({ status: 'OFFLINE' }),
         }).catch(() => {});
       }
@@ -632,12 +1587,13 @@ export default function AgentDashboard() {
     try { window.localStorage.removeItem('agent_profile'); } catch {}
     try { window.localStorage.removeItem('selected_session'); } catch {}
     socket.disconnect();
-    setHydrated(false);
     router.push('/agent/auth');
-  };
+  }, [router, token]);
 
   useEffect(() => {
     // Hydrate from storage on first mount: token, profile, selected session
+    if (didHydrateRef.current) return;
+    didHydrateRef.current = true;
     try {
       const savedToken = typeof window !== 'undefined' ? window.localStorage.getItem('agent_token') : null;
       const savedProfile = typeof window !== 'undefined' ? window.localStorage.getItem('agent_profile') : null;
@@ -648,7 +1604,7 @@ export default function AgentDashboard() {
         socket.auth = { token: savedToken };
         socket.connect();
         socket.emit('agent_ready');
-        refreshOfflineMessages();
+        refreshOfflineMessages(savedToken);
       }
       if (!savedToken) {
         setStatus('Please log in');
@@ -662,7 +1618,7 @@ export default function AgentDashboard() {
           phone?: string;
           avatarUrl?: string;
           status?: string;
-          isAdmin?: boolean;
+          role?: AgentRole;
         };
         setAgentEmail(p.email || '');
         setName(p.name || '');
@@ -671,7 +1627,7 @@ export default function AgentDashboard() {
         setAgentPhone(p.phone || '');
         setAgentAvatarUrl(p.avatarUrl || '');
         setPresenceOnline((p.status || 'ONLINE') === 'ONLINE');
-        setIsAdmin(!!p.isAdmin);
+        setSelfRole(p.role || 'AGENT');
       }
       if (savedSession) {
         setSelectedSession(savedSession);
@@ -697,36 +1653,15 @@ export default function AgentDashboard() {
         router.replace('/agent/auth');
       }
     } catch {}
-    setHydrated(true);
-  }, []);
+  }, [router, refreshOfflineMessages]);
 
   useEffect(() => {
-    if (!token) {
+    if (!token || !isAdmin) {
       setCsatStats(null);
       return;
     }
-    let abort = false;
-    fetch(`${BACKEND_URL}/analytics/csat`, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-      .then((res) => (res.ok ? res.json() : null))
-      .then((payload) => {
-        if (abort) return;
-        if (payload) {
-          setCsatStats({
-            average: payload.average ?? null,
-            total: payload.total ?? 0,
-            positive: payload.positive ?? 0,
-          });
-        }
-      })
-      .catch(() => {
-        if (!abort) setCsatStats(null);
-      });
-    return () => {
-      abort = true;
-    };
-  }, [token]);
+    refreshCsat();
+  }, [token, isAdmin, refreshCsat]);
 
   // Refresh agents when token changes
   useEffect(() => {
@@ -737,11 +1672,12 @@ export default function AgentDashboard() {
       .catch(() => {});
   }, [token]);
 
-  // Load mail settings for admins
+  // Load mail settings only when the admin email section is in view
   useEffect(() => {
     if (!token || !isAdmin) return;
+    if (activeView !== 'admin' || adminSection !== 'email') return;
     loadMailSettings();
-  }, [token, isAdmin, loadMailSettings]);
+  }, [token, isAdmin, activeView, adminSection, loadMailSettings]);
 
   useEffect(() => {
     // Persist selected session
@@ -800,11 +1736,20 @@ export default function AgentDashboard() {
     socket.on('force_logout', (payload: { reason?: string }) => {
       handleLogout({ reason: payload?.reason });
     });
+    socket.on('offline_message_created', () => {
+      void refreshOfflineMessages();
+    });
+    socket.on('offline_message_handled', () => {
+      void refreshOfflineMessages();
+    });
     socket.on('new_chat_available', async (data: { sessionId: string }) => {
       // Fetch visitor and issueType for the sessionId
       if (!token) {
         // No token yet; add without visitor/issueType
-        setAvailableChats((prev) => [...prev, { sessionId: data.sessionId }]);
+        setAvailableChats((prev) => {
+          if (prev.some((chat) => chat.sessionId === data.sessionId)) return prev;
+          return [...prev, { sessionId: data.sessionId }];
+        });
         setNewChats((prev) => ({ ...prev, [data.sessionId]: true }));
         return;
       }
@@ -821,16 +1766,28 @@ export default function AgentDashboard() {
             issueType: sessionData.issueType,
             createdAt: sessionData.createdAt,
           };
-          setAvailableChats((prev) => [...prev, enriched]);
+          setAvailableChats((prev) => {
+            const idx = prev.findIndex((chat) => chat.sessionId === data.sessionId);
+            if (idx === -1) return [...prev, enriched];
+            const next = [...prev];
+            next[idx] = { ...next[idx], ...enriched };
+            return next;
+          });
           setNewChats((prev) => ({ ...prev, [data.sessionId]: true }));
         } else {
           // Fallback: add without visitor/issueType
-          setAvailableChats((prev) => [...prev, { sessionId: data.sessionId }]);
+          setAvailableChats((prev) => {
+            if (prev.some((chat) => chat.sessionId === data.sessionId)) return prev;
+            return [...prev, { sessionId: data.sessionId }];
+          });
           setNewChats((prev) => ({ ...prev, [data.sessionId]: true }));
         }
       } catch {
         // Fallback: add without visitor/issueType
-        setAvailableChats((prev) => [...prev, { sessionId: data.sessionId }]);
+        setAvailableChats((prev) => {
+          if (prev.some((chat) => chat.sessionId === data.sessionId)) return prev;
+          return [...prev, { sessionId: data.sessionId }];
+        });
         setNewChats((prev) => ({ ...prev, [data.sessionId]: true }));
       }
     });
@@ -913,8 +1870,9 @@ export default function AgentDashboard() {
       setRowToasts(prev => ({ ...prev, [sessionId]: toast }));
       setTimeout(() => {
         setRowToasts(prev => {
-          const { [sessionId]: _ignored, ...rest } = prev;
-          return rest;
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
         });
       }, 2500);
     });
@@ -946,8 +1904,9 @@ export default function AgentDashboard() {
       });
       setAssignedAgents((prev) => {
         if (!prev[data.sessionId]) return prev;
-        const { [data.sessionId]: _removed, ...rest } = prev;
-        return rest;
+        const next = { ...prev };
+        delete next[data.sessionId];
+        return next;
       });
       if (selectedSession && data.sessionId === selectedSession) {
         // fetch closedAt for accurate total duration
@@ -985,7 +1944,7 @@ export default function AgentDashboard() {
       socket.off('chat_closed');
       socket.off('force_logout');
     };
-  }, [selectedSession, token]);
+  }, [selectedSession, token, selfAgentId, handleLogout]);
 
   useEffect(() => {
     // Clear typing indicator when switching sessions
@@ -1042,7 +2001,7 @@ export default function AgentDashboard() {
       socket.off('new_chat_notification');
       socket.off('new_message_notification');
     };
-  }, []);
+  }, [selectedSession]);
 
   const requestNotifications = async () => {
     if (typeof window === 'undefined' || !('Notification' in window)) return;
@@ -1052,7 +2011,86 @@ export default function AgentDashboard() {
     } catch {}
   };
 
+  const openInboxSession = async (session: InboxSessionListItem) => {
+    if (!session?.id) return;
+    if (session.status === 'CLOSED') {
+      await openClosedChat(session.id);
+      setActiveView('workspace');
+      setActiveTab('chats');
+      return;
+    }
+
+    if (!session.agent) {
+      await acceptChat(session.id);
+      return;
+    }
+
+    setSelectedSessionClosedAt(undefined);
+    setSelectedSessionCreatedAt(session.createdAt);
+    setSelectedSessionAgent({
+      id: session.agent.id,
+      name: session.agent.name ?? undefined,
+      displayName: session.agent.displayName ?? undefined,
+      email: session.agent.email ?? undefined,
+    });
+    setSelectedSession(session.id);
+    setUnreadCounts((prev) => ({ ...prev, [session.id]: 0 }));
+    socket.emit('join_session', { sessionId: session.id }, () => {
+      setIsLoadingHistory(true);
+      socket.emit('get_chat_history', { sessionId: session.id }, (history: MessageEvent[]) => {
+        setMessages(history);
+        setIsLoadingHistory(false);
+      });
+    });
+    setActiveView('workspace');
+    setActiveTab('chats');
+  };
+
+  const takeNext = useCallback(async () => {
+    if (!token) {
+      setStatus('Please log in');
+      return;
+    }
+    if (takeNextBusy) return;
+    setTakeNextBusy(true);
+    setStatus('Taking next chat...');
+    try {
+      const res = await fetch(`${BACKEND_URL}/sessions/take-next`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const payload = await res.json().catch(() => null);
+      if (!res.ok) {
+        setStatus(payload?.error ? `Take next failed: ${payload.error}` : 'Take next failed');
+        return;
+      }
+      const session = payload?.session as InboxSessionListItem | undefined;
+      if (!session?.id) {
+        setStatus('Take next failed');
+        return;
+      }
+      setStatus('Chat assigned');
+      await openInboxSession(session);
+      if (activeView === 'inbox') {
+        void loadInbox();
+      }
+    } catch {
+      setStatus('Take next failed');
+    } finally {
+      setTakeNextBusy(false);
+    }
+  }, [activeView, loadInbox, takeNextBusy, token]);
+
   const acceptChat = async (sessionId: string) => {
+    if (!token) {
+      setStatus('Please log in to accept chats');
+      return;
+    }
+    if (!presenceOnline) {
+      try {
+        await togglePresence(true);
+      } catch {}
+    }
     socket.emit('agent_accept', { sessionId }, async (resp: { ok?: boolean; error?: string }) => {
       if (resp?.ok) {
         setSelectedSession(sessionId);
@@ -1063,7 +2101,11 @@ export default function AgentDashboard() {
         // inline toast feedback
         setRowToasts(prev => ({ ...prev, [sessionId]: 'Accepted by You' }));
         setTimeout(() => {
-          setRowToasts(prev => { const { [sessionId]: _ignored, ...rest } = prev; return rest; });
+          setRowToasts(prev => {
+            const next = { ...prev };
+            delete next[sessionId];
+            return next;
+          });
         }, 2500);
         // Explicitly join the session room to ensure real-time messages
         socket.emit('join_session', { sessionId }, () => {
@@ -1149,7 +2191,11 @@ export default function AgentDashboard() {
 
   const openClosedChat = async (sessionId: string) => {
     // Open a closed chat in read-only mode (no accept). Join room and fetch history/meta.
+    setActiveView('workspace');
+    setActiveTab('chats');
     setSelectedSession(sessionId);
+    setSelectedSessionCreatedAt(undefined);
+    setSelectedSessionClosedAt(undefined);
     socket.emit('join_session', { sessionId }, () => {
       setIsLoadingHistory(true);
       socket.emit('get_chat_history', { sessionId }, (history: MessageEvent[]) => {
@@ -1181,39 +2227,6 @@ export default function AgentDashboard() {
         .slice(0, 2)
         .toUpperCase()
     : 'AG';
-
-  const saveProfile = async () => {
-    if (!token) return;
-    setStatus('Saving profile...');
-    try {
-      const res = await fetch(`${BACKEND_URL}/me`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ name, displayName: agentDisplayName, phone: agentPhone, avatarUrl: agentAvatarUrl }),
-      });
-      if (!res.ok) throw new Error('Save failed');
-      setStatus('Profile saved');
-    } catch {
-      setStatus('Save failed');
-    }
-  };
-
-  const changePassword = async () => {
-    if (!token || !pwdCurrent || !pwdNew) return;
-    setStatus('Updating password...');
-    try {
-      const res = await fetch(`${BACKEND_URL}/me/password`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ currentPassword: pwdCurrent, newPassword: pwdNew }),
-      });
-      if (!res.ok) throw new Error('Password update failed');
-      setPwdCurrent(''); setPwdNew('');
-      setStatus('Password updated');
-    } catch {
-      setStatus('Password update failed');
-    }
-  };
 
   const setAgentPassword = async (agentId: string) => {
     if (!token) return;
@@ -1296,237 +2309,440 @@ export default function AgentDashboard() {
     } catch {}
   };
 
+  const focusOfflineWorkspace = () => {
+    setActiveView('inbox');
+    setActiveTab('offline');
+  };
+
   if (!mounted) return null;
 
+  const closeUnlockModal = () => {
+    setShowMailUnlockModal(false);
+    setMailUnlockSecret('');
+    setMailUnlockError(null);
+  };
+
+  const closeSecretModal = () => {
+    setShowMailSecretModal(false);
+    setMailSecretCurrent('');
+    setMailSecretNew('');
+  };
+
   return (
-    <div className="h-screen w-full flex flex-col p-4 bg-gray-100 dark:bg-gray-900">
-      {/* Notification banners */}
-      {notifPermission === 'denied' && (
-        <div className="mb-3 rounded border border-amber-300 bg-amber-50 text-amber-800 px-3 py-2 text-sm">
-          Notifications are blocked by the browser. Click the lock/tune icon in the address bar to enable, then reload.
-        </div>
-      )}
-      {notifPermission === 'default' && (
-        <div className="mb-3 rounded border border-sky-300 bg-sky-50 text-sky-800 px-3 py-2 text-sm flex items-center justify-between">
-          <span>Enable notifications to get alerts for new chats and messages.</span>
-          <Button size="sm" onClick={requestNotifications}>Enable</Button>
-        </div>
-      )}
-      <Card className="mb-4">
-        <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <div className="flex items-center gap-3">
-            <Avatar className="h-10 w-10">
-              {agentAvatarUrl ? <AvatarImage src={agentAvatarUrl} alt="avatar" /> : null}
-              <AvatarFallback>{initials}</AvatarFallback>
-            </Avatar>
-            <div>
-              <CardTitle className="text-lg font-semibold leading-tight" style={{ color: PRIMARY_COLOR }}>
-                {agentIdentityLabel}
-              </CardTitle>
-              {agentEmail && <div className="text-sm text-muted-foreground">{agentEmail}</div>}
-              <div className="mt-2 flex flex-wrap gap-2 text-xs sm:text-sm">
-                <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 ${presenceBadgeMeta.toneClass}`}>
-                  <PresenceIcon className="h-4 w-4" />
-                  <span>{presenceBadgeMeta.label}</span>
-                  <Switch id="presence" checked={presenceOnline} onCheckedChange={togglePresence} />
-                </span>
-                <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 ${statusBadgeMeta.toneClass}`}>
-                  <StatusIcon className="h-4 w-4" />
-                  <span>{statusBadgeMeta.label}</span>
-                </span>
+    <div className="min-h-screen w-full bg-slate-50 bg-[radial-gradient(circle_at_top,rgba(2,79,158,0.12),transparent_55%)] px-4 py-6 dark:bg-slate-950">
+      {showMailUnlockModal && (
+        <div className="fixed inset-0 z-70 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-2xl border border-indigo-200/60 bg-white/95 p-6 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
+            <div className="space-y-4">
+              <div>
+                <p className="text-sm font-semibold text-slate-900 dark:text-white">Unlock mail settings</p>
+                <p className="text-sm text-muted-foreground">
+                  Enter the integration password to reveal SMTP credentials.
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="mail-unlock-secret">Integration password</Label>
+                <Input
+                  id="mail-unlock-secret"
+                  type="password"
+                  value={mailUnlockSecret}
+                  onChange={(e) => setMailUnlockSecret(e.target.value)}
+                  disabled={mailUnlocking}
+                  autoFocus
+                />
+                {mailUnlockError && <p className="text-sm text-red-600">{mailUnlockError}</p>}
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button variant="ghost" onClick={closeUnlockModal} disabled={mailUnlocking}>
+                  Cancel
+                </Button>
+                <Button onClick={unlockMailSettings} disabled={mailUnlocking || !mailUnlockSecret.trim()}>
+                  {mailUnlocking ? 'Unlocking…' : 'Unlock'}
+                </Button>
               </div>
             </div>
           </div>
-          <div className="flex flex-col gap-2 text-sm text-muted-foreground md:text-right">
-            <div>Connection: {status}</div>
-            <Button size="sm" variant="outline" onClick={() => handleLogout()} className="self-start md:self-end">Log out</Button>
-          </div>
-        </CardHeader>
-        <CardContent className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          {overviewStats.map((stat) => {
-            const StatIcon = stat.icon;
-            return (
-              <div
-                key={stat.label}
-                className={`rounded-lg p-3 transition-colors duration-150 ${stat.toneClass}`}
-              >
-                <div className="flex items-center justify-between text-xs font-medium uppercase tracking-wide">
-                  <span>{stat.label}</span>
-                  <StatIcon className="h-4 w-4" />
-                </div>
-                <div className="mt-1 text-2xl font-semibold text-foreground">{stat.value}</div>
-              </div>
-            );
-          })}
-        </CardContent>
-      </Card>
+        </div>
+      )}
 
-      <Card className="mb-4">
-        <CardHeader className="flex items-center justify-between">
-          <CardTitle className="text-lg font-semibold" style={{ color: PRIMARY_COLOR }}>
-            Routing & Departments
-          </CardTitle>
-          {departmentsLoading && <Loader2 className="h-4 w-4 text-muted-foreground" />}
-        </CardHeader>
-        <CardContent>
-          {departments.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No departments configured.</p>
-          ) : (
-            <div className="flex flex-wrap gap-2">
-              {departments.map((dept) => {
-                const joined = joinedDepartments.includes(dept.id);
+      {showMailSecretModal && (
+        <div className="fixed inset-0 z-70 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+          <div className="w-full max-w-lg rounded-2xl border border-indigo-200/60 bg-white/95 p-6 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
+            <div className="space-y-5">
+              <div>
+                <p className="text-sm font-semibold text-slate-900 dark:text-white">Set integration password</p>
+                <p className="text-sm text-muted-foreground">
+                  This shared secret is required before anyone can edit SMTP credentials. Use at least 8 characters.
+                </p>
+              </div>
+              {mailSecretToken && (
+                <>
+                  <div className="rounded-xl border border-amber-200 bg-amber-50/70 p-3 text-sm text-amber-900 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-100">
+                    <p className="font-medium">Already unlocked</p>
+                    <p>You may change the password by providing the current value below.</p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="mail-transcript-intro">Transcript email intro</Label>
+                    <Textarea
+                      id="mail-transcript-intro"
+                      placeholder="Thanks for chatting with us today..."
+                      value={mailTranscriptIntro}
+                      onChange={(e) => setMailTranscriptIntro(e.target.value)}
+                      disabled={mailLoading || mailSaving}
+                      rows={4}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      This optional message appears above every emailed transcript.
+                    </p>
+                  </div>
+                </>
+              )}
+              <div className="grid gap-3">
+                <div className="space-y-2">
+                  <Label htmlFor="mail-secret-current">Current integration password (optional)</Label>
+                  <Input
+                    id="mail-secret-current"
+                    type="password"
+                    value={mailSecretCurrent}
+                    onChange={(e) => setMailSecretCurrent(e.target.value)}
+                    disabled={mailSecretSaving}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="mail-secret-new">New integration password</Label>
+                  <Input
+                    id="mail-secret-new"
+                    type="password"
+                    value={mailSecretNew}
+                    onChange={(e) => setMailSecretNew(e.target.value)}
+                    disabled={mailSecretSaving}
+                  />
+                </div>
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button variant="ghost" onClick={closeSecretModal} disabled={mailSecretSaving}>
+                  Cancel
+                </Button>
+                <Button onClick={saveIntegrationSecret} disabled={mailSecretSaving || mailSecretNew.trim().length < 8}>
+                  {mailSecretSaving ? 'Saving…' : 'Save password'}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 md:flex-row">
+        <aside className="md:w-64">
+          <div className="sticky top-6 flex flex-col gap-6 rounded-3xl border border-slate-200/80 bg-white/70 p-5 shadow-xl ring-1 ring-slate-100 backdrop-blur dark:border-slate-800 dark:bg-slate-900/60 dark:ring-slate-800">
+            <div className="space-y-1">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">Agent Console</p>
+              <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Kangenchat</h1>
+              <p className="text-sm text-muted-foreground">Navigate tools and workspaces</p>
+            </div>
+            <div className="space-y-2">
+              {primaryNavItems.map((item) => {
+                const Icon = item.icon;
+                const isActive = activeView === item.id;
                 return (
-                  <Button
-                    key={dept.id}
-                    size="sm"
-                    variant={joined ? 'default' : 'outline'}
-                    className="rounded-full px-3"
-                    onClick={() => updateDepartmentMembership(dept.id, !joined)}
-                    disabled={departmentBusyId === dept.id}
+                  <button
+                    key={item.id}
+                    onClick={() => {
+                      if (item.disabled) return;
+                      if (item.id === 'inbox') {
+                        setActiveView('inbox');
+                        setActiveTab('offline');
+                        return;
+                      }
+                      setActiveView(item.id);
+                    }}
+                    disabled={item.disabled}
+                    className={`group w-full rounded-2xl border px-4 py-3 text-left transition disabled:opacity-50 ${
+                      isActive
+                        ? 'border-transparent bg-linear-to-r from-primary/90 to-sky-500/80 text-white shadow-lg'
+                        : 'border-slate-200 bg-white/70 text-slate-600 hover:border-slate-300 hover:bg-white dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-300'
+                    }`}
                   >
-                    <span className="text-xs font-semibold">{dept.name}</span>
-                    <span className="ml-2 text-[10px] text-muted-foreground">
-                      {joined ? 'Available' : 'Join'}
-                    </span>
-                  </Button>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <span
+                          className={`flex h-9 w-9 items-center justify-center rounded-xl bg-linear-to-br ${item.accent}`}
+                        >
+                          <Icon className={`h-4 w-4 ${isActive ? 'text-slate-900/80 dark:text-white' : 'text-slate-600 dark:text-slate-300'}`} />
+                        </span>
+                        <div>
+                          <p className={`text-sm font-semibold ${isActive ? 'text-white' : 'text-slate-700 dark:text-slate-100'}`}>{item.label}</p>
+                          <p className={`text-xs ${isActive ? 'text-white/80' : 'text-slate-500 dark:text-slate-400'}`}>{item.description}</p>
+                        </div>
+                      </div>
+                      {typeof item.metric === 'number' && (
+                        <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${isActive ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-200'}`}>
+                          {item.metric}
+                        </span>
+                      )}
+                    </div>
+                  </button>
                 );
               })}
             </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* In-app fallback alerts */}
-      {alerts.length > 0 && (
-        <div className="mb-3 space-y-2">
-          {alerts.map((a, i) => (
-            <div key={`${i}-${a}`} className="rounded border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm">
-              {a}
+            <div className="rounded-2xl border border-dashed border-slate-200/80 bg-slate-50/80 p-4 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-300">
+              <p className="font-semibold text-slate-700 dark:text-white">Need another tool?</p>
+              <p className="mt-1">Use the nav to preview upcoming modules like Automations and Org Settings.</p>
+              <Button variant="outline" size="sm" className="mt-3 w-full" onClick={focusOfflineWorkspace}>
+                Jump to inbox ↗
+              </Button>
             </div>
-          ))}
-        </div>
-      )}
+          </div>
+        </aside>
 
-      <Tabs value={activeTab} onValueChange={(v)=>setActiveTab(v as any)} className="flex-1">
-        <TabsList>
-          <TabsTrigger value="chats">Chats</TabsTrigger>
-          <TabsTrigger value="offline">Offline Messages</TabsTrigger>
-          <TabsTrigger value="profile">Profile</TabsTrigger>
-          {isAdmin && <TabsTrigger value="admin">Admin</TabsTrigger>}
-        </TabsList>
-        <Separator className="my-3" />
-
-        <TabsContent value="chats" className="flex-1">
-          <div className="grid grid-cols-3 gap-4">
-            <Card className="col-span-1">
-              <CardHeader>
-                <CardTitle className="text-lg font-semibold leading-tight" style={{ color: PRIMARY_COLOR }}>
-                  Available Chats
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="mb-4 space-y-3">
-                  <div className="flex flex-wrap gap-2">
-                    {[
-                      { key: 'waiting', label: `Waiting (${waitingCount})` },
-                      { key: 'active', label: `Active (${activeCount})` },
-                      { key: 'closed', label: `Closed (${closedCount})` },
-                    ].map((tab) => (
-                      <Button
-                        key={tab.key}
-                        variant={queueView === tab.key ? 'default' : 'outline'}
-                        size="sm"
-                        onClick={() => setQueueView(tab.key as typeof queueView)}
-                      >
-                        {tab.label}
-                      </Button>
-                    ))}
-                  </div>
-                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                    <div className="flex flex-1 flex-col gap-2 sm:flex-row sm:items-center">
-                      <div className="relative flex-1">
-                        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                        <Input
-                          value={chatSearch}
-                          onChange={(event) => setChatSearch(event.target.value)}
-                          placeholder="Search visitor, email, or issue"
-                          className="pl-9"
-                        />
-                      </div>
-                      {chatSearch && (
-                        <Button variant="ghost" size="sm" onClick={() => setChatSearch('')}>Clear</Button>
-                      )}
-                    </div>
-                    {queueView !== 'closed' && (
-                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-2">
-                        <div className="flex items-center gap-2">
-                          <Filter className="h-4 w-4 text-muted-foreground" />
-                          <Select value={chatFilter} onValueChange={(value: typeof chatFilter) => setChatFilter(value)}>
-                            <SelectTrigger className="h-9 w-[140px]">
-                              <SelectValue placeholder="Filter" />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="all">All chats</SelectItem>
-                              <SelectItem value="mine">My chats</SelectItem>
-                              <SelectItem value="unassigned">Unassigned</SelectItem>
-                              <SelectItem value="new">New</SelectItem>
-                            </SelectContent>
-                          </Select>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <Loader2 className="h-4 w-4 text-muted-foreground" />
-                          <Select value={chatSort} onValueChange={(value: typeof chatSort) => setChatSort(value)}>
-                            <SelectTrigger className="h-9 w-[150px]">
-                              <SelectValue placeholder="Sort by" />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="wait">Longest wait</SelectItem>
-                              <SelectItem value="recent">Most recent</SelectItem>
-                            </SelectContent>
-                          </Select>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                  <div className="grid gap-2 text-sm">
-                    <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
-                      <div className="flex items-center gap-2"><Inbox className="h-4 w-4" /><span>{queueView === 'waiting' ? 'Waiting' : queueView === 'active' ? 'Active' : 'Closed'} chats</span></div>
-                      <span className="font-medium text-foreground">{filteredQueueChats.length}</span>
-                    </div>
-                    <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
-                      <div className="flex items-center gap-2"><Users className="h-4 w-4" /><span>Agents online</span></div>
-                      <span className="font-medium text-foreground">{onlineAgents.length}</span>
-                    </div>
-                    <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
-                      <div className="flex items-center gap-2"><Clock className="h-4 w-4" /><span>Longest wait</span></div>
-                      <span className="font-medium text-foreground">{longestWaitSummary}</span>
-                    </div>
-                    <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
-                      <div className="flex items-center gap-2"><Inbox className="h-4 w-4" /><span>Filtered chats</span></div>
-                      <span className="font-medium text-foreground">{filteredQueueCount}</span>
-                    </div>
-                    <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
-                      <div className="flex flex-col">
-                        <span className="flex items-center gap-2"><Clock className="h-4 w-4" /><span>Slowest waiting</span></span>
-                        {slowestWaitingChat ? (
-                          <span className="text-xs text-muted-foreground">{slowestWaitingChat.visitor?.name || slowestWaitingChat.sessionId.slice(-4)} · {slowestWaitingChat.waitMinutes} min</span>
-                        ) : (
-                          <span className="text-xs text-muted-foreground">—</span>
-                        )}
-                      </div>
-                      <span className="font-medium text-foreground">{slowestWaitingChat ? `${slowestWaitingChat.waitMinutes}m` : '—'}</span>
-                    </div>
-                    <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
-                      <div className="flex items-center gap-2"><Sparkles className="h-4 w-4" /><span>CSAT</span></div>
-                      <span className="font-medium text-foreground">{csatScore !== null ? `${csatScore.toFixed(1)}%` : '—'}</span>
-                    </div>
-                  </div>
+        <main className="flex-1 space-y-6">
+          {activeView === 'workspace' || activeView === 'inbox' ? (
+            <div className="flex flex-col gap-4">
+              {/* Notification banners */}
+              {notifPermission === 'denied' && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50/80 px-4 py-3 text-sm font-medium text-amber-900 shadow-sm">
+                  Notifications are blocked by the browser. Click the lock/tune icon in the address bar to enable, then reload.
                 </div>
-                <ScrollArea className="h-[60vh]">
-                  <ul>
-                    {filteredQueueChats.length === 0 && (
-                      <li className="text-sm text-muted-foreground py-6 text-center">No chats match the current filters.</li>
-                    )}
+              )}
+              {notifPermission === 'default' && (
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-sky-200 bg-sky-50/80 px-4 py-3 text-sm text-sky-900 shadow-sm">
+                  <span className="font-medium">Enable notifications to get alerts for new chats and messages.</span>
+                  <Button size="sm" variant="default" onClick={requestNotifications}>
+                    Enable desktop alerts
+                  </Button>
+                </div>
+              )}
+              <Card className="border border-white/70 bg-linear-to-br from-white/95 via-slate-50/90 to-slate-100/80 shadow-[0_25px_70px_rgba(15,23,42,0.08)] ring-1 ring-slate-100/70 backdrop-blur-xl dark:border-slate-800/70 dark:bg-linear-to-br dark:from-slate-950/70 dark:via-slate-900/60 dark:to-slate-900/40 dark:ring-slate-900/70">
+                <CardHeader className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                  <div className="flex flex-1 flex-col gap-4 sm:flex-row sm:items-center">
+                    <Avatar className="h-14 w-14 border border-slate-200 shadow-sm">
+                      {agentAvatarUrl ? <AvatarImage src={agentAvatarUrl} alt="avatar" /> : null}
+                      <AvatarFallback className="text-base font-semibold">{initials}</AvatarFallback>
+                    </Avatar>
+                    <div className="space-y-1">
+                      <CardTitle className="text-2xl font-semibold text-slate-900 dark:text-white">
+                        {agentIdentityLabel}
+                      </CardTitle>
+                      {agentEmail && <div className="text-sm text-muted-foreground">{agentEmail}</div>}
+                      {agentPhone && (
+                        <div className="text-xs uppercase tracking-wide text-slate-400">{agentPhone}</div>
+                      )}
+                      <div className="mt-2 flex flex-wrap items-center gap-2 text-xs sm:text-sm">
+                        <div className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 shadow-sm ${presenceBadgeMeta.toneClass}`}>
+                          <PresenceIcon className="h-4 w-4" />
+                          <span className="font-semibold">{presenceBadgeMeta.label}</span>
+                          <Switch id="presence" checked={presenceOnline} onCheckedChange={togglePresence} />
+                        </div>
+                        <div className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 shadow-sm ${statusBadgeMeta.toneClass}`}>
+                          <StatusIcon className="h-4 w-4" />
+                          <span>{statusBadgeMeta.label}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-3 text-sm text-muted-foreground md:w-64 md:text-right">
+                    <div className="rounded-lg border border-slate-200/80 bg-slate-50 px-3 py-2 text-left text-slate-600 dark:border-slate-800 dark:bg-slate-900/40 dark:text-slate-200 md:text-right">
+                      <span className="text-xs uppercase tracking-wide">Connection</span>
+                      <div className="text-sm font-medium text-slate-900 dark:text-white">{status}</div>
+                    </div>
+                    <div className="flex flex-wrap gap-2 md:justify-end">
+                      <Button size="sm" variant="ghost" onClick={() => refreshOfflineMessages()}>
+                        Refresh inbox
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={() => handleLogout()}>
+                        Log out
+                      </Button>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                  {overviewStats.map((stat) => {
+                    const StatIcon = stat.icon;
+                    return (
+                      <div
+                        key={stat.label}
+                        className={`rounded-2xl border bg-white/70 p-4 text-slate-800 shadow-md transition hover:-translate-y-0.5 hover:shadow-lg dark:bg-slate-900/60 dark:text-slate-100 ${stat.toneClass}`}
+                      >
+                        <div className="flex items-center justify-between text-xs font-semibold uppercase tracking-wide">
+                          <span>{stat.label}</span>
+                          <StatIcon className="h-4 w-4" />
+                        </div>
+                        <div className="mt-2 text-3xl font-bold">{stat.value}</div>
+                      </div>
+                    );
+                  })}
+                </CardContent>
+              </Card>
+
+              <Card className="border border-amber-100/80 bg-linear-to-br from-amber-50/90 via-white to-amber-50/70 shadow-xl ring-1 ring-amber-100/70 dark:border-amber-900/40 dark:bg-linear-to-br dark:from-amber-950/30 dark:via-slate-900/60 dark:to-amber-950/10 dark:ring-amber-900/40">
+                <CardHeader className="flex items-center justify-between">
+                  <CardTitle className="text-lg font-semibold" style={{ color: PRIMARY_COLOR }}>
+                    Routing & Departments
+                  </CardTitle>
+                  {departmentsLoading && <Loader2 className="h-4 w-4 text-muted-foreground" />}
+                </CardHeader>
+                <CardContent>
+                  {departments.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">No departments configured.</p>
+                  ) : (
+                    <div className="flex flex-wrap gap-2">
+                      {departments.map((dept) => {
+                        const isAssigned = Object.prototype.hasOwnProperty.call(assignedDepartments, dept.id);
+                        const isAvailable = isAssigned ? assignedDepartments[dept.id] : false;
+                        const buttonDisabled = departmentBusyId === dept.id || !isAssigned;
+                        return (
+                          <Button
+                            key={dept.id}
+                            size="sm"
+                            variant={!isAssigned ? 'secondary' : isAvailable ? 'default' : 'outline'}
+                            className="rounded-full px-3"
+                            onClick={() => {
+                              if (!isAssigned) {
+                                setStatus('Ask an admin to assign you to this department before going available.');
+                                return;
+                              }
+                              updateDepartmentMembership(dept.id, !isAvailable);
+                            }}
+                            disabled={buttonDisabled}
+                          >
+                            <span className="text-xs font-semibold">{dept.name}</span>
+                            <span className="ml-2 text-[10px] text-muted-foreground">
+                              {!isAssigned ? 'Not assigned' : isAvailable ? 'Available' : 'Go available'}
+                            </span>
+                          </Button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              {/* In-app fallback alerts */}
+              {alerts.length > 0 && (
+                <div className="space-y-2">
+                  {alerts.map((a, i) => (
+                    <div key={`${i}-${a}`} className="rounded border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm">
+                      {a}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as typeof activeTab)} className="flex-1">
+                <TabsList className="flex flex-wrap gap-2 rounded-full bg-slate-50/80 px-2 py-1 shadow-[inset_0_1px_8px_rgba(15,23,42,0.08)] ring-1 ring-slate-200/70 backdrop-blur dark:bg-slate-900/70 dark:ring-slate-800">
+                  <TabsTrigger value="chats" className="rounded-full px-4 py-2 text-sm font-semibold text-slate-500 data-[state=active]:bg-indigo-600 data-[state=active]:text-white dark:text-slate-300">Chats</TabsTrigger>
+                  <TabsTrigger value="offline" className="rounded-full px-4 py-2 text-sm font-semibold text-slate-500 data-[state=active]:bg-rose-500 data-[state=active]:text-white dark:text-slate-300">Offline Messages</TabsTrigger>
+                  <TabsTrigger value="profile" className="rounded-full px-4 py-2 text-sm font-semibold text-slate-500 data-[state=active]:bg-emerald-500 data-[state=active]:text-white dark:text-slate-300">Profile</TabsTrigger>
+                </TabsList>
+                <div className="mt-4 rounded-[32px] border border-white/70 bg-linear-to-br from-white/95 via-slate-50/85 to-blue-50/70 p-6 shadow-[0_35px_120px_rgba(15,23,42,0.12)] ring-1 ring-slate-100/80 backdrop-blur dark:border-slate-900/60 dark:bg-linear-to-br dark:from-slate-950/80 dark:via-slate-900/70 dark:to-slate-900/50 dark:ring-slate-900/70">
+                  <Separator className="my-4" />
+
+                  <TabsContent value="chats" className="flex-1">
+                    <div className="grid grid-cols-3 gap-5">
+                      <Card className="col-span-1 border border-slate-100/70 bg-linear-to-b from-slate-50 via-white to-slate-100 shadow-lg ring-1 ring-slate-200/60 dark:border-slate-800 dark:bg-linear-to-b dark:from-slate-900/70 dark:via-slate-950/40 dark:to-slate-950/30 dark:ring-slate-800">
+                        <CardHeader className="rounded-2xl bg-sky-100/70 px-5 py-4">
+                          <CardTitle className="text-lg font-semibold leading-tight" style={{ color: PRIMARY_COLOR }}>
+                            Available Chats
+                          </CardTitle>
+                        </CardHeader>
+                        <CardContent className="space-y-4 px-5 pb-5 pt-4">
+                          <div className="mb-4 space-y-3">
+                            <div className="flex flex-wrap gap-2">
+                              {[
+                                { key: 'waiting', label: `Waiting (${waitingCount})` },
+                                { key: 'active', label: `Active (${activeCount})` },
+                                { key: 'closed', label: `Closed (${closedCount})` },
+                              ].map((tab) => (
+                                <Button
+                                  key={tab.key}
+                                  variant={queueView === tab.key ? 'default' : 'outline'}
+                                  size="sm"
+                                  onClick={() => setQueueView(tab.key as typeof queueView)}
+                                >
+                                  {tab.label}
+                                </Button>
+                              ))}
+                            </div>
+                            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                              <div className="flex flex-1 flex-col gap-2 sm:flex-row sm:items-center">
+                                <div className="relative flex-1">
+                                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                                  <Input
+                                    value={chatSearch}
+                                    onChange={(event) => setChatSearch(event.target.value)}
+                                    placeholder="Search visitor, email, or issue"
+                                    className="pl-9"
+                                  />
+                                </div>
+                                {chatSearch && (
+                                  <Button variant="ghost" size="sm" onClick={() => setChatSearch('')}>Clear</Button>
+                                )}
+                              </div>
+                              {queueView !== 'closed' && (
+                                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-2">
+                                  <div className="flex items-center gap-2">
+                                    <Filter className="h-4 w-4 text-muted-foreground" />
+                                    <Select value={chatFilter} onValueChange={(value: typeof chatFilter) => setChatFilter(value)}>
+                                      <SelectTrigger className="h-9 w-[140px]">
+                                        <SelectValue placeholder="Filter" />
+                                      </SelectTrigger>
+                                      <SelectContent>
+                                        <SelectItem value="all">All chats</SelectItem>
+                                        <SelectItem value="mine">My chats</SelectItem>
+                                        <SelectItem value="unassigned">Unassigned</SelectItem>
+                                        <SelectItem value="new">New</SelectItem>
+                                      </SelectContent>
+                                    </Select>
+                                  </div>
+                                  <div className="flex items-center gap-2">
+                                    <Loader2 className="h-4 w-4 text-muted-foreground" />
+                                    <Select value={chatSort} onValueChange={(value: typeof chatSort) => setChatSort(value)}>
+                                      <SelectTrigger className="h-9 w-[150px]">
+                                        <SelectValue placeholder="Sort by" />
+                                      </SelectTrigger>
+                                      <SelectContent>
+                                        <SelectItem value="wait">Longest wait</SelectItem>
+                                        <SelectItem value="recent">Most recent</SelectItem>
+                                      </SelectContent>
+                                    </Select>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                            <div className="grid gap-2 text-sm">
+                              <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
+                                <div className="flex items-center gap-2"><Inbox className="h-4 w-4" /><span>{queueView === 'waiting' ? 'Waiting' : queueView === 'active' ? 'Active' : 'Closed'} chats</span></div>
+                                <span className="font-medium text-foreground">{filteredQueueChats.length}</span>
+                              </div>
+                              <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
+                                <div className="flex items-center gap-2"><Users className="h-4 w-4" /><span>Agents online</span></div>
+                                <span className="font-medium text-foreground">{onlineAgents.length}</span>
+                              </div>
+                              <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
+                                <div className="flex items-center gap-2"><Clock className="h-4 w-4" /><span>Longest wait</span></div>
+                                <span className="font-medium text-foreground">{longestWaitSummary}</span>
+                              </div>
+                              <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
+                                <div className="flex items-center gap-2"><Inbox className="h-4 w-4" /><span>Filtered chats</span></div>
+                                <span className="font-medium text-foreground">{filteredQueueCount}</span>
+                              </div>
+                              <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
+                                <div className="flex flex-col">
+                                  <span className="flex items-center gap-2"><Clock className="h-4 w-4" /><span>Slowest waiting</span></span>
+                                  {slowestWaitingChat ? (
+                                    <span className="text-xs text-muted-foreground">{slowestWaitingChat.visitor?.name || slowestWaitingChat.sessionId.slice(-4)} · {slowestWaitingChat.waitMinutes} min</span>
+                                  ) : (
+                                    <span className="text-xs text-muted-foreground">No waiting chats</span>
+                                  )}
+                                </div>
+                                <span className="text-sm font-semibold text-foreground">
+                                  {slowestWaitingChat ? `${slowestWaitingChat.waitMinutes} min` : '—'}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                          <ScrollArea className="h-[60vh] rounded-2xl border border-slate-200/70 bg-linear-to-b from-white via-slate-50 to-slate-100 p-3 shadow-inner dark:border-slate-800 dark:bg-linear-to-b dark:from-slate-950/60 dark:via-slate-900/50 dark:to-slate-900/40">
+                            <ul>
                     {queueView !== 'closed' && filteredQueueChats.map((chat) => {
                       const waitMinutes = computeWaitMinutes(chat.createdAt);
                       const waitLabel = waitMinutes === null
@@ -1554,7 +2770,7 @@ export default function AgentDashboard() {
                             }`}
                             aria-pressed={selectedSession === chat.sessionId}
                             onClick={() => acceptChat(chat.sessionId)}
-                            disabled={queueView === 'waiting' ? (!presenceOnline || !token || !!assignedAgents[chat.sessionId]) : false}
+                            disabled={queueView === 'waiting' ? (!token || !!assignedAgents[chat.sessionId]) : false}
                           >
                             <div className="flex flex-col items-start gap-1">
                               <span className="text-sm font-medium text-foreground">{chat.visitor?.name || chat.visitor?.email || chat.issueType || `Session ${chat.sessionId.slice(-4)}`}</span>
@@ -1649,8 +2865,8 @@ export default function AgentDashboard() {
               </CardContent>
             </Card>
 
-            <Card className="col-span-2">
-              <CardHeader>
+            <Card className="col-span-2 flex flex-col overflow-hidden border border-indigo-100/70 bg-linear-to-b from-white via-indigo-50/80 to-white/90 shadow-xl ring-1 ring-indigo-100/70 dark:border-slate-800 dark:bg-linear-to-b dark:from-slate-950/70 dark:via-slate-900/60 dark:to-slate-900/40 dark:ring-slate-900/60">
+              <CardHeader className="rounded-2xl bg-indigo-100/70 px-5 py-4">
                 <CardTitle className="flex items-center justify-between">
                   <span className="flex items-center gap-3">
                     <span>Active Chat</span>
@@ -1705,50 +2921,57 @@ export default function AgentDashboard() {
                   </span>
                 </CardTitle>
               </CardHeader>
-              <CardContent className="flex flex-col h-[60vh]">
+              <CardContent className="flex h-[60vh] max-h-[60vh] min-h-0 flex-col gap-4 overflow-hidden rounded-2xl bg-linear-to-b from-white/95 via-slate-50/70 to-white/90 px-5 py-5 shadow-inner dark:bg-linear-to-b dark:from-slate-950/70 dark:via-slate-900/60 dark:to-slate-900/40">
                 {selectedSession ? (
                   <>
-                    <ScrollArea className="flex-1 border rounded-md p-4 mb-4" ref={scrollAreaRef}>
-                      {isLoadingHistory && (
-                        <div className="text-center text-sm text-muted-foreground py-3">Loading messages...</div>
-                      )}
-                      {messages.length === 0 && !isLoadingHistory && (
-                        <div className="text-center text-sm text-muted-foreground py-3">No messages yet</div>
-                      )}
-                      {messages.map((msg, index) => {
-                        const prev = index > 0 ? messages[index - 1] : null;
-                        const curDate = new Date(msg.createdAt).toDateString();
-                        const prevDate = prev ? new Date(prev.createdAt).toDateString() : '';
-                        const showDay = !prev || curDate !== prevDate;
-                        const time = new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                        return (
-                          <div key={msg.id ?? `${msg.sessionId}-${msg.createdAt ?? 't'}-${index}`}>
-                            {showDay && (
-                              <div className="my-2 text-center text-xs text-muted-foreground">
-                                {new Date(msg.createdAt).toLocaleDateString()}
+                    <div className="flex-1 min-h-0 overflow-hidden rounded-2xl border border-indigo-100/70 bg-linear-to-b from-white via-indigo-50/60 to-white/85 shadow-inner dark:border-slate-800 dark:bg-linear-to-b dark:from-slate-950/70 dark:via-slate-900/60 dark:to-slate-900/50">
+                      <div className="h-full max-h-full overflow-y-auto p-4 pr-5" ref={scrollAreaRef}>
+                        {isLoadingHistory && (
+                          <div className="text-center text-sm text-muted-foreground py-3">Loading messages...</div>
+                        )}
+                        {messages.length === 0 && !isLoadingHistory && (
+                          <div className="text-center text-sm text-muted-foreground py-3">No messages yet</div>
+                        )}
+                        {messages.map((msg, index) => {
+                          const prev = index > 0 ? messages[index - 1] : null;
+                          const curDate = new Date(msg.createdAt).toDateString();
+                          const prevDate = prev ? new Date(prev.createdAt).toDateString() : '';
+                          const showDay = !prev || curDate !== prevDate;
+                          const time = new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                          return (
+                            <div key={msg.id ?? `${msg.sessionId}-${msg.createdAt ?? 't'}-${index}`}>
+                              {showDay && (
+                                <div className="my-2 text-center text-xs text-muted-foreground">
+                                  {new Date(msg.createdAt).toLocaleDateString()}
+                                </div>
+                              )}
+                              <div className={`mb-2 text-sm ${msg.role === 'AGENT' ? 'text-right' : 'text-left'}`}>
+                                <div
+                                  className={`inline-block p-2 rounded-lg ${
+                                    msg.role === 'AGENT' ? 'text-white' : 'bg-gray-200 dark:bg-gray-700'
+                                  }`}
+                                  style={msg.role === 'AGENT' ? { backgroundColor: PRIMARY_COLOR } : undefined}
+                                >
+                                  <span
+                                    className="whitespace-pre-wrap text-sm"
+                                    dangerouslySetInnerHTML={{ __html: renderMessageContent(msg.content) }}
+                                  />
+                                </div>
+                                <div className={`mt-1 text-[10px] text-muted-foreground ${msg.role === 'AGENT' ? 'text-right' : 'text-left'}`}>{time}</div>
                               </div>
-                            )}
-                            <div className={`mb-2 text-sm ${msg.role === 'AGENT' ? 'text-right' : 'text-left'}`}>
-                              <div
-                                className={`inline-block p-2 rounded-lg ${
-                                  msg.role === 'AGENT' ? 'text-white' : 'bg-gray-200 dark:bg-gray-700'
-                                }`}
-                                style={msg.role === 'AGENT' ? { backgroundColor: PRIMARY_COLOR } : undefined}
-                              >
-                                <span
-                                  className="whitespace-pre-wrap text-sm"
-                                  dangerouslySetInnerHTML={{ __html: renderMessageContent(msg.content) }}
-                                />
-                              </div>
-                              <div className={`mt-1 text-[10px] text-muted-foreground ${msg.role === 'AGENT' ? 'text-right' : 'text-left'}`}>{time}</div>
                             </div>
+                          );
+                        })}
+                        {isTyping && (
+                          <div className="mt-3 inline-flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-[11px] italic text-slate-600 shadow-sm">
+                            <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" aria-hidden="true" />
+                            {isTyping.role === 'USER' ? 'User is typing…' : 'Agent is typing…'}
                           </div>
-                        );
-                      })}
-                      {isTyping && <p className="text-sm italic">{isTyping.role === 'USER' ? 'User is typing...' : 'Agent is typing...'}</p>}
-                    </ScrollArea>
-                    <div className="flex flex-col gap-2">
-                      <div className="flex space-x-2">
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex flex-col gap-3 rounded-2xl bg-slate-50/70 p-3">
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:space-x-2">
                         <Input
                           placeholder="Type a message..."
                           value={messageInput}
@@ -1762,14 +2985,16 @@ export default function AgentDashboard() {
                           }}
                           onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
                         />
-                        <Button
-                          type="button"
-                          variant="outline"
-                          onClick={() => setShowEmojiPickerAgent(prev => !prev)}
-                        >
-                          🙂
-                        </Button>
-                        <Button onClick={sendMessage}>Send</Button>
+                        <div className="flex gap-2">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => setShowEmojiPickerAgent(prev => !prev)}
+                          >
+                            🙂
+                          </Button>
+                          <Button onClick={sendMessage}>Send</Button>
+                        </div>
                       </div>
                       {showEmojiPickerAgent && (
                         <div className="flex flex-wrap gap-1 rounded-md border border-slate-200 bg-slate-50 p-2 text-lg shadow-sm">
@@ -1789,6 +3014,13 @@ export default function AgentDashboard() {
                         </div>
                       )}
                     </div>
+                    {selectedSession && !selectedSessionClosedAt && (
+                      <div className="sticky bottom-2 mt-2 flex justify-end">
+                        <Button variant="destructive" size="sm" onClick={endChat}>
+                          End chat
+                        </Button>
+                      </div>
+                    )}
                     <div className="mt-3 flex flex-col gap-2">
                       <div className="flex items-center gap-2">
                         <Input
@@ -1815,8 +3047,8 @@ export default function AgentDashboard() {
         </TabsContent>
 
         <TabsContent value="offline" className="flex-1">
-          <Card className="h-full">
-            <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <Card className="h-full border border-rose-100/70 bg-linear-to-b from-white via-rose-50/70 to-white/90 shadow-xl ring-1 ring-rose-100/70 dark:border-rose-900/40 dark:bg-linear-to-b dark:from-slate-950/70 dark:via-rose-950/30 dark:to-slate-900/40 dark:ring-rose-900/50">
+            <CardHeader className="flex flex-col gap-3 rounded-2xl bg-rose-100/70 px-5 py-4 md:flex-row md:items-center md:justify-between">
               <div>
                 <CardTitle>Offline Messages</CardTitle>
                 <p className="text-sm text-muted-foreground">
@@ -1825,13 +3057,13 @@ export default function AgentDashboard() {
               </div>
               <div className="flex items-center gap-3 text-sm text-muted-foreground">
                 <span>Pending: <span className="font-semibold text-foreground">{offlinePendingCount}</span></span>
-                <Button variant="outline" size="sm" onClick={refreshOfflineMessages} disabled={offlineLoading}>
+                <Button variant="outline" size="sm" onClick={() => refreshOfflineMessages()} disabled={offlineLoading}>
                   {offlineLoading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
                   Refresh
                 </Button>
               </div>
             </CardHeader>
-            <CardContent className="h-[65vh]">
+            <CardContent className="h-[65vh] rounded-2xl bg-linear-to-b from-white via-rose-50/50 to-white/90 px-5 py-5 shadow-inner dark:bg-linear-to-b dark:from-slate-950/70 dark:via-rose-950/30 dark:to-slate-900/50">
               <ScrollArea className="h-full pr-2">
                 {offlineMessages.length === 0 && !offlineLoading ? (
                   <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
@@ -1913,73 +3145,210 @@ export default function AgentDashboard() {
           </Card>
         </TabsContent>
 
-        {isAdmin && (
-          <TabsContent value="admin" className="flex-1 space-y-4">
-            <Card className="h-full">
-              <CardHeader>
-                <CardTitle>Admin Tools</CardTitle>
-                <p className="text-sm text-muted-foreground">
-                  Set or reset passwords, or remotely log agents off. Changes take effect immediately and do not notify agents.
-                </p>
+      </div>
+      </Tabs>
+    </div>
+  ) : activeView === 'admin' ? (
+    <div className="space-y-6">
+      <div className="grid gap-6 lg:grid-cols-[260px,1fr]">
+        <Card className="border border-purple-100/70 bg-white/85 shadow-sm dark:border-purple-900/40 dark:bg-slate-900/60">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base">Admin Tools</CardTitle>
+            <p className="text-sm text-muted-foreground">Switch between org-level tasks.</p>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {adminNavItems.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                aria-pressed={adminSection === item.id}
+                onClick={() => setAdminSection(item.id)}
+                className={`w-full rounded-2xl border px-4 py-3 text-left transition ${
+                  adminSection === item.id
+                    ? 'border-transparent bg-purple-600 text-white shadow-lg'
+                    : 'border-slate-200 bg-white/70 text-slate-600 hover:border-slate-300 hover:bg-white dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-300'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className={`text-sm font-semibold ${adminSection === item.id ? 'text-white' : 'text-slate-600 dark:text-slate-300'}`}>
+                      {item.label}
+                    </p>
+                    <p className={`text-xs ${adminSection === item.id ? 'text-white/80' : 'text-slate-500 dark:text-slate-400'}`}>
+                      {item.description}
+                    </p>
+                  </div>
+                  {typeof item.metric === 'number' && (
+                    <span
+                      className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+                        adminSection === item.id ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-200'
+                      }`}
+                    >
+                      {item.metric}
+                    </span>
+                  )}
+                </div>
+              </button>
+            ))}
+          </CardContent>
+        </Card>
+
+        <div className="space-y-6">
+          {adminSection === 'departments' && (
+            <Card className="border border-white/70 bg-linear-to-b from-white via-slate-50/60 to-white/85 shadow-xl ring-1 ring-purple-100/60 dark:border-slate-800 dark:bg-linear-to-b dark:from-slate-950/70 dark:via-slate-900/60 dark:to-slate-900/40 dark:ring-slate-900/70">
+              <CardHeader className="rounded-2xl bg-purple-100/60 px-5 py-4">
+                <CardTitle>Departments</CardTitle>
+                <p className="text-sm text-muted-foreground">Create routing groups and manage membership.</p>
               </CardHeader>
               <CardContent className="space-y-4">
-                {agents.length === 0 ? (
-                  <div className="text-sm text-muted-foreground">No agents found.</div>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <Input
+                    value={newDepartmentName}
+                    onChange={(e) => setNewDepartmentName(e.target.value)}
+                    placeholder="New department name"
+                    disabled={createDepartmentBusy}
+                  />
+                  <Button
+                    size="sm"
+                    onClick={createDepartment}
+                    disabled={createDepartmentBusy || !newDepartmentName.trim()}
+                  >
+                    {createDepartmentBusy ? 'Creating…' : 'Create'}
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={loadDepartments} disabled={departmentsLoading}>
+                    {departmentsLoading ? 'Loading…' : 'Reload'}
+                  </Button>
+                </div>
+                {departments.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 p-4 text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900/40 dark:text-slate-300">
+                    No departments configured yet.
+                  </div>
                 ) : (
                   <div className="space-y-3">
-                    {agents.map((agent) => {
-                      const isSelf = agent.id === selfAgentId;
-                      const isOffline = (agent.status || 'OFFLINE') !== 'ONLINE';
+                    {departments.map((dept) => {
+                      const members: DepartmentAgent[] = (dept.agentDepartments ?? []).map((m) => m.agent);
+                      const selectedAgentId = departmentAssignSelection[dept.id] || '';
+                      const isEditingName = typeof departmentEditName[dept.id] === 'string';
+                      const editNameValue = isEditingName ? departmentEditName[dept.id] : '';
                       return (
-                        <div
-                          key={agent.id}
-                          className="flex flex-col gap-2 rounded-md border border-border bg-background/60 p-3 md:flex-row md:items-center md:justify-between"
-                        >
-                          <div className="space-y-1 text-sm">
-                            <div className="font-medium text-foreground">
-                              {agent.displayName || agent.name || agent.email}
-                              {isSelf && <span className="ml-1 text-xs text-muted-foreground">(you)</span>}
-                            </div>
-                            <div className="text-xs text-muted-foreground">{agent.email}</div>
-                            {agent.status && (
-                              <div className="text-xs text-muted-foreground">Status: {agent.status}</div>
-                            )}
-                          </div>
-                          <div className="flex flex-col gap-2 md:w-80">
+                        <div key={dept.id} className="rounded-lg border border-border bg-background p-3">
+                          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                             <div className="flex flex-col gap-2">
-                              <Label htmlFor={`admin-password-${agent.id}`} className="text-xs">
-                                Set new password (min 8 chars)
-                              </Label>
-                              <Input
-                                id={`admin-password-${agent.id}`}
-                                type="password"
-                                value={adminPwdMap[agent.id] || ''}
-                                onChange={(e) =>
-                                  setAdminPwdMap((prev) => ({ ...prev, [agent.id]: e.target.value }))
-                                }
-                              />
-                              <div className="flex flex-wrap gap-2">
-                                <Button
-                                  size="sm"
-                                  onClick={() => setAgentPassword(agent.id)}
-                                  disabled={!!adminPwdBusy[agent.id] || !adminPwdMap[agent.id]}
-                                >
-                                  {adminPwdBusy[agent.id] ? 'Updating...' : 'Set password'}
-                                </Button>
-                                <Button
-                                  size="sm"
-                                  variant="outline"
-                                  onClick={() => logoffAgent(agent.id)}
-                                  disabled={isSelf || isOffline || !!adminLogoutBusy[agent.id]}
-                                >
-                                  {adminLogoutBusy[agent.id]
-                                    ? 'Logging off...'
-                                    : isOffline
-                                    ? 'Already offline'
-                                    : 'Log off'}
-                                </Button>
-                              </div>
+                              {isEditingName ? (
+                                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                                  <Input
+                                    value={editNameValue}
+                                    onChange={(e) =>
+                                      setDepartmentEditName((prev) => ({ ...prev, [dept.id]: e.target.value }))
+                                    }
+                                    className="h-8 w-64"
+                                    disabled={departmentAdminBusyKey === `${dept.id}:rename`}
+                                  />
+                                  <div className="flex gap-2">
+                                    <Button
+                                      size="sm"
+                                      onClick={() => renameDepartment(dept.id)}
+                                      disabled={
+                                        departmentAdminBusyKey === `${dept.id}:rename` || !editNameValue.trim()
+                                      }
+                                    >
+                                      {departmentAdminBusyKey === `${dept.id}:rename` ? 'Saving…' : 'Save'}
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      variant="outline"
+                                      onClick={() =>
+                                        setDepartmentEditName((prev) => {
+                                          const next = { ...prev };
+                                          delete next[dept.id];
+                                          return next;
+                                        })
+                                      }
+                                      disabled={departmentAdminBusyKey === `${dept.id}:rename`}
+                                    >
+                                      Cancel
+                                    </Button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="flex items-center gap-2">
+                                  <div className="text-sm font-semibold text-foreground">{dept.name}</div>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    className="h-7 px-2"
+                                    onClick={() => setDepartmentEditName((prev) => ({ ...prev, [dept.id]: dept.name }))}
+                                    disabled={departmentAdminBusyKey === `${dept.id}:delete`}
+                                  >
+                                    Rename
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="destructive"
+                                    className="h-7 px-2"
+                                    onClick={() => deleteDepartment(dept.id)}
+                                    disabled={departmentAdminBusyKey === `${dept.id}:delete`}
+                                  >
+                                    {departmentAdminBusyKey === `${dept.id}:delete` ? 'Deleting…' : 'Delete'}
+                                  </Button>
+                                </div>
+                              )}
                             </div>
+                            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                              <Select
+                                value={selectedAgentId}
+                                onValueChange={(value) =>
+                                  setDepartmentAssignSelection((prev) => ({ ...prev, [dept.id]: value }))
+                                }
+                              >
+                                <SelectTrigger className="h-8 w-56">
+                                  <SelectValue placeholder="Add agent" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {agents.map((a) => (
+                                    <SelectItem key={a.id} value={a.id}>
+                                      {(a.displayName || a.name || a.email) + (a.status ? ` (${a.status})` : '')}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                              <Button
+                                size="sm"
+                                onClick={() => assignAgentToDepartment(dept.id, selectedAgentId)}
+                                disabled={!selectedAgentId || departmentAdminBusyKey === `${dept.id}:assign`}
+                              >
+                                {departmentAdminBusyKey === `${dept.id}:assign` ? 'Adding…' : 'Add'}
+                              </Button>
+                            </div>
+                          </div>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {members.length === 0 ? (
+                              <div className="text-xs text-muted-foreground">No agents assigned.</div>
+                            ) : (
+                              members.map((agent: DepartmentAgent) => {
+                                const key = `${dept.id}:${agent.id}:remove`;
+                                return (
+                                  <div
+                                    key={agent.id}
+                                    className="inline-flex items-center gap-2 rounded-full border border-border bg-background px-3 py-1 text-xs"
+                                  >
+                                    <span>
+                                      {agent.displayName || agent.name || agent.email}
+                                      {agent.status ? ` (${agent.status})` : ''}
+                                    </span>
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      className="h-6 px-2"
+                                      onClick={() => unassignAgentFromDepartment(dept.id, agent.id)}
+                                      disabled={departmentAdminBusyKey === key}
+                                    >
+                                      {departmentAdminBusyKey === key ? 'Removing…' : 'Remove'}
+                                    </Button>
+                                  </div>
+                                );
+                              })
+                            )}
                           </div>
                         </div>
                       );
@@ -1987,13 +3356,238 @@ export default function AgentDashboard() {
                   </div>
                 )}
               </CardContent>
+              {mailLocked && (
+                <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 rounded-2xl bg-white/80 backdrop-blur-sm dark:bg-slate-900/60">
+                  <div className="flex flex-col items-center gap-2 text-center">
+                    <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-indigo-100 text-indigo-900 dark:bg-indigo-900/40 dark:text-indigo-100">
+                      <Lock className="h-5 w-5" />
+                    </div>
+                    <div>
+                      <p className="font-semibold text-slate-900 dark:text-white">Mail settings are locked</p>
+                      <p className="text-sm text-muted-foreground">
+                        Enter the integration password to edit SMTP credentials.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap justify-center gap-3">
+                    <Button variant="outline" onClick={() => setShowMailUnlockModal(true)}>
+                      Unlock settings
+                    </Button>
+                    <Button variant="ghost" onClick={() => setShowMailSecretModal(true)}>
+                      Forgot / rotate password
+                    </Button>
+                  </div>
+                </div>
+              )}
             </Card>
+          )}
 
-            <Card>
-              <CardHeader>
-                <CardTitle>Email Settings</CardTitle>
+          {adminSection === 'agents' && (
+            <Card className="border border-white/70 bg-linear-to-b from-white via-slate-50/60 to-white/85 shadow-xl ring-1 ring-purple-100/60 dark:border-slate-800 dark:bg-linear-to-b dark:from-slate-950/70 dark:via-slate-900/60 dark:to-slate-900/40 dark:ring-slate-900/70">
+              <CardHeader className="rounded-2xl bg-purple-100/60 px-5 py-4">
+                <CardTitle>Agent management</CardTitle>
+                <p className="text-sm text-muted-foreground">Invite teammates, reset passwords, or remotely sign them out.</p>
+              </CardHeader>
+              <CardContent className="space-y-5">
+                <div className="rounded-2xl border border-dashed border-purple-200/80 bg-white/70 p-4 shadow-sm dark:border-purple-900/40 dark:bg-slate-950/40">
+                  <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+                    <div className="flex-1 grid gap-3 sm:grid-cols-2">
+                      <div className="space-y-1.5">
+                        <Label htmlFor="new-agent-name">Full name</Label>
+                        <Input
+                          id="new-agent-name"
+                          placeholder="Taylor Agent"
+                          value={newAgentName}
+                          onChange={(e) => setNewAgentName(e.target.value)}
+                          disabled={newAgentBusy}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label htmlFor="new-agent-display-name">Display name (optional)</Label>
+                        <Input
+                          id="new-agent-display-name"
+                          placeholder="Taylor @ HQ"
+                          value={newAgentDisplayName}
+                          onChange={(e) => setNewAgentDisplayName(e.target.value)}
+                          disabled={newAgentBusy}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label htmlFor="new-agent-email">Email</Label>
+                        <Input
+                          id="new-agent-email"
+                          type="email"
+                          placeholder="taylorsupport@company.com"
+                          value={newAgentEmail}
+                          onChange={(e) => setNewAgentEmail(e.target.value)}
+                          disabled={newAgentBusy}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label htmlFor="new-agent-phone">Phone (optional)</Label>
+                        <Input
+                          id="new-agent-phone"
+                          placeholder="+1 (555) 000-1234"
+                          value={newAgentPhone}
+                          onChange={(e) => setNewAgentPhone(e.target.value)}
+                          disabled={newAgentBusy}
+                        />
+                      </div>
+                      <div className="space-y-1.5 sm:col-span-2">
+                        <Label htmlFor="new-agent-password">Temporary password</Label>
+                        <Input
+                          id="new-agent-password"
+                          type="password"
+                          placeholder={`min ${MIN_AGENT_PASSWORD_LENGTH} characters`}
+                          value={newAgentPassword}
+                          onChange={(e) => setNewAgentPassword(e.target.value)}
+                          disabled={newAgentBusy}
+                        />
+                      </div>
+                      <div className="flex items-center gap-3 sm:col-span-2">
+                        <Select value={newAgentRole} onValueChange={(value) => setNewAgentRole(value as AgentRole)} disabled={newAgentBusy}>
+                          <SelectTrigger id="new-agent-role" className="w-48">
+                            <SelectValue placeholder="Select role" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="AGENT">Agent</SelectItem>
+                            <SelectItem value="MANAGER">Manager</SelectItem>
+                            <SelectItem value="ADMIN">Admin</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <div>
+                          <Label htmlFor="new-agent-role" className="text-sm font-medium">
+                            Role
+                          </Label>
+                          <p className="text-xs text-muted-foreground">Admins manage org settings; Managers oversee analytics/chats.</p>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex w-full flex-col gap-2 md:w-48">
+                      <Button onClick={createAgent} disabled={newAgentBusy}>
+                        {newAgentBusy ? 'Creating…' : 'Create agent'}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        onClick={() => {
+                          setNewAgentName('');
+                          setNewAgentDisplayName('');
+                          setNewAgentEmail('');
+                          setNewAgentPhone('');
+                          setNewAgentPassword('');
+                          setNewAgentRole('AGENT');
+                        }}
+                        disabled={newAgentBusy}
+                      >
+                        Clear form
+                      </Button>
+                      <p className="text-xs text-muted-foreground">
+                        New agents receive no automated email yet—share the temporary password manually.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                {agents.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 p-4 text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900/40 dark:text-slate-300">
+                    No agents found.
+                  </div>
+                ) : (
+                  agents.map((agent) => {
+                    const isSelf = agent.id === selfAgentId;
+                    const isOffline = (agent.status || 'OFFLINE') !== 'ONLINE';
+                    return (
+                      <div
+                        key={agent.id}
+                        className="flex flex-col gap-2 rounded-md border border-border bg-background/60 p-3 md:flex-row md:items-center md:justify-between"
+                      >
+                        <div className="space-y-1 text-sm">
+                          <div className="font-medium text-foreground">
+                            {agent.displayName || agent.name || agent.email}
+                            {(agent.role === 'ADMIN' || agent.role === 'MANAGER') && (
+                              <span className="ml-2 inline-flex items-center rounded-full bg-purple-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-purple-800 dark:bg-purple-900/30 dark:text-purple-200">
+                                {ROLE_LABEL[agent.role]}
+                              </span>
+                            )}
+                            {isSelf && <span className="ml-1 text-xs text-muted-foreground">(you)</span>}
+                          </div>
+                          <div className="text-xs text-muted-foreground">{agent.email}</div>
+                          {agent.phone && <div className="text-xs text-muted-foreground">{agent.phone}</div>}
+                          {agent.status && <div className="text-xs text-muted-foreground">Status: {agent.status}</div>}
+                        </div>
+                        <div className="flex flex-col gap-2 md:w-80">
+                          <div className="flex items-center gap-2">
+                            <Label htmlFor={`role-${agent.id}`} className="text-xs">Role:</Label>
+                            <Select
+                              value={agent.role || 'AGENT'}
+                              onValueChange={(value) => updateAgentRole(agent.id, value as AgentRole)}
+                            >
+                              <SelectTrigger className="w-24 h-8">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="AGENT">Agent</SelectItem>
+                                <SelectItem value="MANAGER">Manager</SelectItem>
+                                <SelectItem value="ADMIN">Admin</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="flex flex-col gap-2">
+                            <Label htmlFor={`admin-password-${agent.id}`} className="text-xs">
+                              Set new password (min {MIN_AGENT_PASSWORD_LENGTH} chars)
+                            </Label>
+                            <Input
+                              id={`admin-password-${agent.id}`}
+                              type="password"
+                              value={adminPwdMap[agent.id] || ''}
+                              onChange={(e) =>
+                                setAdminPwdMap((prev) => ({ ...prev, [agent.id]: e.target.value }))
+                              }
+                            />
+                            <div className="flex flex-wrap gap-2">
+                              <Button
+                                size="sm"
+                                onClick={() => setAgentPassword(agent.id)}
+                                disabled={!!adminPwdBusy[agent.id] || !(adminPwdMap[agent.id] || '').trim()}
+                              >
+                                {adminPwdBusy[agent.id] ? 'Updating…' : 'Set password'}
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => logoffAgent(agent.id)}
+                                disabled={isSelf || isOffline || !!adminLogoutBusy[agent.id]}
+                              >
+                                {adminLogoutBusy[agent.id]
+                                  ? 'Logging off…'
+                                  : isOffline
+                                  ? 'Already offline'
+                                  : 'Log off'}
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="destructive"
+                                onClick={() => deleteAgent(agent.id)}
+                                disabled={isSelf || !!adminDeleteBusy[agent.id]}
+                              >
+                                {adminDeleteBusy[agent.id] ? 'Deleting…' : 'Delete'}
+                              </Button>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </CardContent>
+            </Card>
+          )}
+
+          {adminSection === 'email' && (
+            <Card className="relative border-none bg-indigo-50/70 shadow-md ring-1 ring-indigo-100 dark:bg-slate-900/70 dark:ring-slate-800">
+              <CardHeader className="rounded-2xl bg-indigo-100/60 px-5 py-4">
+                <CardTitle>Email settings</CardTitle>
                 <p className="text-sm text-muted-foreground">
-                  Configure SMTP settings used for password reset and transcript emails. These settings override environment defaults.
+                  Configure SMTP credentials for password reset and transcript messages. These override env defaults.
                 </p>
               </CardHeader>
               <CardContent className="space-y-4">
@@ -2022,7 +3616,7 @@ export default function AgentDashboard() {
                 <div className="flex items-center justify-between gap-4">
                   <div className="space-y-1">
                     <Label htmlFor="mail-secure">Use secure connection (TLS)</Label>
-                    <p className="text-xs text-muted-foreground">Enable for SMTPS/strict TLS endpoints.</p>
+                    <p className="text-xs text-muted-foreground">Enable for SMTPS / TLS-only endpoints.</p>
                   </div>
                   <Switch
                     id="mail-secure"
@@ -2064,24 +3658,578 @@ export default function AgentDashboard() {
                     disabled={mailLoading || mailSaving}
                   />
                 </div>
-                <div className="flex items-center justify-end gap-3 pt-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={loadMailSettings}
+                <div className="space-y-2">
+                  <Label htmlFor="mail-transcript-intro-field">Transcript email intro</Label>
+                  <Textarea
+                    id="mail-transcript-intro-field"
+                    placeholder="Thanks for chatting with us today..."
+                    value={mailTranscriptIntro}
+                    onChange={(e) => setMailTranscriptIntro(e.target.value)}
                     disabled={mailLoading || mailSaving}
-                  >
-                    {mailLoading ? 'Reloading...' : 'Reload from server'}
-                  </Button>
-                  <Button size="sm" onClick={saveMailSettings} disabled={mailSaving || mailLoading}>
-                    {mailSaving ? 'Saving...' : 'Save settings'}
-                  </Button>
+                    rows={4}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Shown above every emailed transcript. Leave blank for no intro.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    {mailRequiresSecret && (
+                      <div className="inline-flex items-center gap-1 rounded-full border border-indigo-200 bg-white/80 px-3 py-1 text-xs text-indigo-900 dark:border-indigo-800/60 dark:bg-slate-900/50 dark:text-indigo-200">
+                        <Lock className="h-3 w-3" />
+                        Integration password enforced
+                      </div>
+                    )}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-xs text-indigo-900 hover:text-indigo-900 dark:text-indigo-200"
+                      onClick={() => setShowMailSecretModal(true)}
+                      disabled={mailLoading || mailSaving}
+                    >
+                      <KeyRound className="mr-2 h-3.5 w-3.5" /> Set integration password
+                    </Button>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => loadMailSettings()}
+                      disabled={mailLoading || mailSaving}
+                    >
+                      {mailLoading ? 'Reloading…' : 'Reload from server'}
+                    </Button>
+                    <Button size="sm" onClick={saveMailSettings} disabled={mailSaving || mailLoading}>
+                      {mailSaving ? 'Saving…' : 'Save settings'}
+                    </Button>
+                  </div>
                 </div>
               </CardContent>
             </Card>
-          </TabsContent>
-        )}
-      </Tabs>
+          )}
+
+          {adminSection === 'upcoming' && (
+            <Card className="border border-dashed border-purple-200 bg-white/80 p-6 text-center shadow-sm dark:border-purple-900/40 dark:bg-slate-900/60">
+              <div className="space-y-3">
+                <CardTitle className="text-lg">More tools coming soon</CardTitle>
+                <p className="text-sm text-muted-foreground">
+                  Billing, org branding, and automation controls will land here as they are built.
+                </p>
+                <Button variant="outline" onClick={() => setAdminSection('departments')}>
+                  Back to departments
+                </Button>
+              </div>
+            </Card>
+          )}
+        </div>
+      </div>
     </div>
+  ) : activeView === 'shortcuts' ? (
+    <div className="space-y-6">
+      <div className="rounded-3xl border border-slate-200/80 bg-white/80 p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900/50">
+        <h2 className="text-xl font-bold text-slate-900 dark:text-white">Shortcuts</h2>
+        <p className="mt-1 text-sm text-muted-foreground">Create canned replies and insert them into the chat composer.</p>
+      </div>
+
+      {toastNotification && (
+        <div
+          className={`fixed bottom-6 right-6 z-50 rounded-xl px-4 py-2 text-sm font-medium shadow-lg ring-1 transition-all ${
+            toastNotification.tone === 'success'
+              ? 'bg-emerald-600 text-white ring-emerald-700/40'
+              : toastNotification.tone === 'error'
+              ? 'bg-red-600 text-white ring-red-700/40'
+              : 'bg-slate-900 text-white ring-slate-700/40'
+          }`}
+          role="status"
+        >
+          {toastNotification.message}
+        </div>
+      )}
+
+      <div className="grid gap-6 lg:grid-cols-2">
+        <Card className="border-none bg-white/90 shadow-xl ring-1 ring-slate-100 dark:bg-slate-900/70 dark:ring-slate-800">
+          <CardHeader className="space-y-3">
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-lg">Your shortcuts</CardTitle>
+              <span className="text-xs text-muted-foreground">{filteredShortcuts.length} items</span>
+            </div>
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={shortcutSearch}
+                onChange={(e) => setShortcutSearch(e.target.value)}
+                placeholder="Search shortcuts"
+                className="pl-9"
+              />
+            </div>
+          </CardHeader>
+          <CardContent>
+            <ScrollArea className="h-[60vh] pr-2">
+              <div className="space-y-3">
+                {filteredShortcuts.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 p-4 text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900/40 dark:text-slate-300">
+                    No shortcuts match your search.
+                  </div>
+                ) : (
+                  filteredShortcuts.map((s) => (
+                    <div key={s.id} className="rounded-2xl border border-slate-200 bg-white/70 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/30">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="text-sm font-semibold text-slate-900 dark:text-white">{s.title}</div>
+                          <div className="mt-1 line-clamp-3 text-sm text-muted-foreground">{s.text}</div>
+                        </div>
+                        <div className="flex flex-col gap-2">
+                          <Button size="sm" onClick={() => applyShortcut(s.text)}>
+                            Use
+                          </Button>
+                          <Button size="sm" variant="outline" onClick={() => copyShortcut(s.text)}>
+                            Copy
+                          </Button>
+                          <Button size="sm" variant="destructive" onClick={() => deleteShortcut(s.id)}>
+                            Delete
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </ScrollArea>
+          </CardContent>
+        </Card>
+
+        <Card className="border-none bg-white/90 shadow-xl ring-1 ring-slate-100 dark:bg-slate-900/70 dark:ring-slate-800">
+          <CardHeader>
+            <CardTitle className="text-lg">Add a shortcut</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="shortcut-title">Title</Label>
+              <Input
+                id="shortcut-title"
+                value={shortcutTitle}
+                onChange={(e) => setShortcutTitle(e.target.value)}
+                placeholder="e.g. Pricing overview"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="shortcut-text">Message</Label>
+              <textarea
+                id="shortcut-text"
+                value={shortcutText}
+                onChange={(e) => setShortcutText(e.target.value)}
+                placeholder="Write the reply you want to reuse..."
+                className="min-h-40 w-full resize-none rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              />
+            </div>
+            <div className="flex items-center justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setShortcutTitle('');
+                  setShortcutText('');
+                }}
+                disabled={!shortcutTitle && !shortcutText}
+              >
+                Clear
+              </Button>
+              <Button onClick={addShortcut} disabled={!shortcutTitle.trim() || !shortcutText.trim()}>
+                Add shortcut
+              </Button>
+            </div>
+            <Separator />
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900/40 dark:text-slate-300">
+              Tip: After clicking <span className="font-semibold">Use</span>, you’ll be returned to the workspace with the message inserted into your composer.
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  ) : activeView === 'csat' ? (
+    <div className="space-y-6">
+      <div className="rounded-3xl border border-sky-200/70 bg-white/80 p-6 shadow-sm dark:border-sky-900/40 dark:bg-slate-900/50">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-xl font-bold text-slate-900 dark:text-white">Customer Satisfaction (CSAT)</h2>
+            <p className="text-sm text-muted-foreground">
+              Monitor customer satisfaction metrics. More detailed reporting will be added here.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="outline" onClick={handleCsatRefresh} disabled={!token || csatRefreshing}>
+              {csatRefreshing ? 'Refreshing…' : 'Refresh'}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setActiveView('workspace')}>
+              Back to workspace
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <div className="rounded-2xl border border-slate-200 bg-linear-to-br from-blue-50 to-blue-100 p-5 text-slate-800 shadow-md dark:border-slate-800 dark:from-slate-800 dark:to-slate-900 dark:text-white">
+          <div className="flex items-center justify-between text-xs font-semibold uppercase tracking-wide">
+            <span>Customer satisfaction score</span>
+            <Sparkles className="h-4 w-4" />
+          </div>
+          <div className="mt-2 text-3xl font-bold">{csatScore !== null ? `${csatScore.toFixed(1)}%` : '—'}</div>
+          <div className="mt-3 h-2 w-full rounded-full bg-white/60 dark:bg-white/10">
+            <div
+              className="h-full rounded-full bg-linear-to-r from-sky-500 to-blue-600 transition-all"
+              style={{ width: csatScore !== null ? `${Math.min(100, Math.max(0, csatScore))}%` : '0%' }}
+            />
+          </div>
+          <p className="mt-2 text-xs text-slate-600 dark:text-slate-300">
+            {csatStats?.total ? `${csatStats.total} surveys this week` : 'No survey submissions yet'}
+          </p>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 bg-white/80 p-5 text-slate-800 shadow-sm dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-100">
+          <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Average rating</div>
+          <div className="mt-2 text-3xl font-bold">
+            {csatStats?.average !== null && csatStats?.average !== undefined ? csatStats.average.toFixed(2) : '—'}
+            <span className="ml-2 text-base font-semibold text-slate-500 dark:text-slate-400">/ 5</span>
+          </div>
+          <div className="mt-2 text-sm text-muted-foreground">Average survey rating for the current period.</div>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 bg-white/80 p-5 text-slate-800 shadow-sm dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-100">
+          <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Positive surveys</div>
+          <div className="mt-2 text-3xl font-bold">
+            {csatStats?.positive ?? 0}
+            {positiveRate !== null && (
+              <span className="ml-2 text-base font-semibold text-slate-500 dark:text-slate-400">{positiveRate}%</span>
+            )}
+          </div>
+          <div className="mt-2 text-sm text-muted-foreground">Count of ratings 4–5.</div>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 bg-white/80 p-5 text-slate-800 shadow-sm dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-100">
+          <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Avg wait to agent</div>
+          <div className="mt-2 text-3xl font-bold">{averageWaitLabel}</div>
+          <div className="mt-2 text-sm text-muted-foreground">
+            Time from visitor first message to first assignment over last {csatStats?.agentWindowDays ?? 30} days.
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 bg-white/80 p-5 text-slate-800 shadow-sm dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-100">
+          <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Avg queue size</div>
+          <div className="mt-2 text-3xl font-bold">{averageQueueLabel}</div>
+          <div className="mt-2 text-sm text-muted-foreground">Estimated concurrent chats waiting for agents.</div>
+        </div>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <div className="rounded-2xl border border-slate-200 bg-white/85 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900/60">
+          <div className="flex items-center justify-between text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+            <span>Rating distribution</span>
+            <span>{csatStats?.total ? `${csatStats.total} total` : 'No data'}</span>
+          </div>
+          <div className="mt-4 space-y-3">
+            {csatDistributionEntries.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-200/80 p-6 text-center text-sm text-muted-foreground dark:border-slate-800/60">
+                No CSAT responses yet.
+              </div>
+            ) : (
+              csatDistributionEntries.map((entry) => (
+                <div key={entry.rating}>
+                  <div className="flex items-center justify-between text-sm font-medium text-slate-700 dark:text-slate-200">
+                    <span>{entry.rating} star{entry.rating === 1 ? '' : 's'}</span>
+                    <span className="text-xs text-muted-foreground">
+                      {entry.value} ({entry.percent}%)
+                    </span>
+                  </div>
+                  <div className="mt-1 h-2 rounded-full bg-slate-100 dark:bg-slate-800">
+                    <div
+                      className="h-full rounded-full bg-linear-to-r from-indigo-500 via-sky-500 to-emerald-400 transition-all"
+                      style={{ width: `${entry.percent}%` }}
+                    />
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 bg-white/85 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900/60">
+          <div className="flex items-center justify-between text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+            <span>Trend (last {csatPeriodDays} days)</span>
+            <span>{csatPeriodResponses} responses</span>
+          </div>
+          <div className="mt-4 space-y-2">
+            {csatTrend.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-200/80 p-6 text-center text-sm text-muted-foreground dark:border-slate-800/60">
+                No recent trend data.
+              </div>
+            ) : (
+              csatTrend.map((point) => {
+                const maxResponses = Math.max(csatTrendMaxResponses, 1);
+                const widthPercent = Math.round((point.responses / maxResponses) * 100);
+                return (
+                  <div key={point.date} className="rounded-xl border border-slate-100/80 bg-slate-50/60 p-3 dark:border-slate-800 dark:bg-slate-900/40">
+                    <div className="flex items-center justify-between text-xs font-semibold text-slate-600 dark:text-slate-300">
+                      <span>{point.date}</span>
+                      <span>
+                        {point.average !== null && point.average !== undefined ? point.average.toFixed(2) : '—'} / 5
+                      </span>
+                    </div>
+                    <div className="mt-2 h-1.5 rounded-full bg-white/70 dark:bg-slate-800">
+                      <div
+                        className="h-full rounded-full bg-linear-to-r from-blue-500 via-sky-500 to-emerald-400 transition-all"
+                        style={{ width: `${widthPercent}%` }}
+                      />
+                    </div>
+                    <div className="mt-1 text-[11px] uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                      {point.responses} responses
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border border-slate-200 bg-white/85 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900/60">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Agent chat handling</div>
+            <p className="text-sm text-muted-foreground">
+              Chats closed in the last {csatStats?.agentWindowDays ?? 30} days.
+            </p>
+          </div>
+          <Button size="sm" variant="outline" onClick={handleCsatRefresh} disabled={!token || csatRefreshing}>
+            {csatRefreshing ? 'Refreshing…' : 'Refresh'}
+          </Button>
+        </div>
+        <div className="mt-4 divide-y divide-slate-200 text-sm dark:divide-slate-800">
+          {displayedAgentChatCounts.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-slate-200/80 p-6 text-center text-sm text-muted-foreground dark:border-slate-800/60">
+              No chats handled in this window.
+            </div>
+          ) : (
+            displayedAgentChatCounts.map((agent, index) => {
+              const sharePercent =
+                csatStats?.total && csatStats.total > 0
+                  ? Math.round((agent.chatsHandled / csatStats.total) * 100)
+                  : null;
+              return (
+                <div key={agent.agentId} className="flex items-center justify-between py-3">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-8 w-8 items-center justify-center rounded-full bg-slate-100 text-xs font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-200">
+                      #{index + 1}
+                    </div>
+                    <div>
+                      <div className="font-semibold text-slate-800 dark:text-slate-100">{agent.name}</div>
+                      <div className="text-xs text-muted-foreground">{sharePercent !== null ? `${sharePercent}% of surveys` : '—'}</div>
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-lg font-semibold text-slate-900 dark:text-white">{agent.chatsHandled}</div>
+                    <div className="text-xs text-muted-foreground">Chats handled</div>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+    </div>
+  ) : activeView === 'departments' ? (
+    <div className="space-y-6">
+      <div className="rounded-3xl border border-emerald-200/70 bg-white/80 p-6 shadow-sm dark:border-emerald-900/40 dark:bg-slate-900/50">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-xl font-bold text-slate-900 dark:text-white">Departments</h2>
+            <p className="text-sm text-muted-foreground">
+              Configure departments for routing and assign agents to each department.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="outline" onClick={loadDepartments} disabled={departmentsLoading}>
+              {departmentsLoading ? 'Loading…' : 'Reload'}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setActiveView('workspace')}>
+              Back to workspace
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      <Card className="border-none bg-emerald-50/70 shadow-md ring-1 ring-emerald-100 dark:bg-slate-900/70 dark:ring-slate-800">
+        <CardHeader className="rounded-2xl bg-emerald-100/60 px-5 py-4">
+          <CardTitle>Department Configuration</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Create, rename, or delete departments and assign agents. Changes apply immediately.
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <Input
+              value={newDepartmentName}
+              onChange={(e) => setNewDepartmentName(e.target.value)}
+              placeholder="New department name"
+              disabled={createDepartmentBusy}
+            />
+            <Button
+              size="sm"
+              onClick={createDepartment}
+              disabled={createDepartmentBusy || !newDepartmentName.trim()}
+            >
+              {createDepartmentBusy ? 'Creating…' : 'Create'}
+            </Button>
+          </div>
+
+          {departments.length === 0 ? (
+            <div className="text-sm text-muted-foreground">No departments configured.</div>
+          ) : (
+            <div className="space-y-3">
+              {departments.map((dept) => {
+                const members: DepartmentAgent[] = (dept.agentDepartments ?? []).map((m) => m.agent);
+                const selectedAgentId = departmentAssignSelection[dept.id] || '';
+                const isEditingName = typeof departmentEditName[dept.id] === 'string';
+                const editNameValue = isEditingName ? departmentEditName[dept.id] : '';
+                return (
+                  <div key={dept.id} className="rounded-lg border border-border bg-background p-3">
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex flex-col gap-2">
+                        {isEditingName ? (
+                          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                            <Input
+                              value={editNameValue}
+                              onChange={(e) => setDepartmentEditName((prev) => ({ ...prev, [dept.id]: e.target.value }))}
+                              className="h-8 w-64"
+                              disabled={departmentAdminBusyKey === `${dept.id}:rename`}
+                            />
+                            <div className="flex gap-2">
+                              <Button
+                                size="sm"
+                                onClick={() => renameDepartment(dept.id)}
+                                disabled={departmentAdminBusyKey === `${dept.id}:rename` || !editNameValue.trim()}
+                              >
+                                {departmentAdminBusyKey === `${dept.id}:rename` ? 'Saving…' : 'Save'}
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() =>
+                                  setDepartmentEditName((prev) => {
+                                    const next = { ...prev };
+                                    delete next[dept.id];
+                                    return next;
+                                  })
+                                }
+                                disabled={departmentAdminBusyKey === `${dept.id}:rename`}
+                              >
+                                Cancel
+                              </Button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-2">
+                            <div className="text-sm font-semibold text-foreground">{dept.name}</div>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-7 px-2"
+                              onClick={() => setDepartmentEditName((prev) => ({ ...prev, [dept.id]: dept.name }))}
+                              disabled={departmentAdminBusyKey === `${dept.id}:delete`}
+                            >
+                              Rename
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="destructive"
+                              className="h-7 px-2"
+                              onClick={() => deleteDepartment(dept.id)}
+                              disabled={departmentAdminBusyKey === `${dept.id}:delete`}
+                            >
+                              {departmentAdminBusyKey === `${dept.id}:delete` ? 'Deleting…' : 'Delete'}
+                            </Button>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                        <Select
+                          value={selectedAgentId}
+                          onValueChange={(value) => setDepartmentAssignSelection((prev) => ({ ...prev, [dept.id]: value }))}
+                        >
+                          <SelectTrigger className="h-8 w-56">
+                            <SelectValue placeholder="Add agent" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {agents.map((a) => (
+                              <SelectItem key={a.id} value={a.id}>
+                                {(a.displayName || a.name || a.email) + (a.status ? ` (${a.status})` : '')}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <Button
+                          size="sm"
+                          onClick={() => assignAgentToDepartment(dept.id, selectedAgentId)}
+                          disabled={!selectedAgentId || departmentAdminBusyKey === `${dept.id}:assign`}
+                        >
+                          {departmentAdminBusyKey === `${dept.id}:assign` ? 'Adding…' : 'Add'}
+                        </Button>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {members.length === 0 ? (
+                        <div className="text-xs text-muted-foreground">No agents assigned.</div>
+                      ) : (
+                        members.map((agent: DepartmentAgent) => {
+                          const key = `${dept.id}:${agent.id}:remove`;
+                          return (
+                            <div
+                              key={agent.id}
+                              className="inline-flex items-center gap-2 rounded-full border border-border bg-background px-3 py-1 text-xs"
+                            >
+                              <span>
+                                {agent.displayName || agent.name || agent.email}
+                                {agent.status ? ` (${agent.status})` : ''}
+                              </span>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-6 px-2"
+                                onClick={() => unassignAgentFromDepartment(dept.id, agent.id)}
+                                disabled={departmentAdminBusyKey === key}
+                              >
+                                {departmentAdminBusyKey === key ? 'Removing…' : 'Remove'}
+                              </Button>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  ) : (
+    <div className="rounded-3xl border border-dashed border-slate-200/80 bg-white/70 p-8 text-center text-slate-500 shadow-inner dark:border-slate-800 dark:bg-slate-900/40 dark:text-slate-300">
+      <p className="text-base font-semibold text-slate-700 dark:text-white">
+        {activeView === 'automations'
+          ? 'Automations module in progress'
+          : 'Organization settings coming soon'}
+      </p>
+      <p className="mt-2 text-sm text-muted-foreground">
+        Switch back to the workspace to handle live chats and routing while we finish building the {activeView} experience.
+      </p>
+      <Button variant="outline" className="mt-4" onClick={() => setActiveView('workspace')}>
+        Return to workspace
+      </Button>
+    </div>
+  )}
+      </main>
+    </div>
+  </div>
   );
 }

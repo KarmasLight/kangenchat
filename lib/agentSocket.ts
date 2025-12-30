@@ -1,6 +1,6 @@
 import { io, Socket } from 'socket.io-client';
 
-export const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5010';
+export const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3010';
 
 // Extend Socket with the same auth shape used by socket.io-client types
 export type AgentSocket = Socket & {

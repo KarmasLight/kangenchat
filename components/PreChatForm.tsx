@@ -10,14 +10,15 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Loader2, MessageCircle, AlertCircle, CheckCircle } from 'lucide-react';
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5010';
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3010';
 
 interface PreChatFormProps {
   onSessionStarted: (data: { sessionId: string; visitorId: string; initialMessage?: string }) => void;
 }
 
 export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
-  const [name, setName] = useState('');
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName] = useState('');
   const [email, setEmail] = useState('');
   const [issueType, setIssueType] = useState('');
   const [message, setMessage] = useState('');
@@ -61,7 +62,8 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          name,
+          firstName,
+          lastName,
           email,
           issueType,
           message: message.trim() || undefined,
@@ -91,7 +93,7 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
       const res = await fetch(`${BACKEND_URL}/offline/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, email, issueType, message }),
+        body: JSON.stringify({ firstName, lastName, email, issueType, message }),
       });
       if (!res.ok) throw new Error('Failed to send offline message');
       const data = await res.json();
@@ -157,13 +159,9 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
     <Card className="w-full max-w-md mx-auto">
       <CardHeader className="text-center pb-2">
         <MessageCircle className="w-8 h-8 mx-auto mb-2 text-primary" />
-        <CardTitle className="text-lg">
-          {agentsOnline ? 'Start a Chat' : 'We\'re Offline'}
-        </CardTitle>
+        <CardTitle className="text-lg">Start a Chat</CardTitle>
         <CardDescription>
-          {agentsOnline
-            ? `Fill in your details to start a live chat with one of our ${agentsCount || 1} available agent${(agentsCount || 1) > 1 ? 's' : ''}.`
-            : 'Leave us a message and we\'ll follow up as soon as an agent is available.'}
+          Fill in your details to start a chat. Our bot will assist you first, and an agent will join if needed.
         </CardDescription>
         <div className="mt-2 flex items-center justify-center gap-2 text-xs text-muted-foreground">
           <span>{checkingAgents ? 'Checking availability…' : `Last checked ${lastCheckedAt ? new Date(lastCheckedAt).toLocaleTimeString() : 'just now'}`}</span>
@@ -172,20 +170,32 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
           </Button>
         </div>
       </CardHeader>
-      <form onSubmit={agentsOnline ? handleStartChat : handleOfflineMessage}>
+      <form onSubmit={handleStartChat}>
         <CardContent className="space-y-4">
           <div className="grid grid-cols-1 gap-4">
-            <div>
-              <Label htmlFor="name">Name</Label>
-              <Input
-                id="name"
-                type="text"
-                placeholder="Your name"
-                value={name}
-                onChange={e => setName(e.target.value)}
-                required
-                disabled={loading}
-              />
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div>
+                <Label htmlFor="firstName">First name (optional)</Label>
+                <Input
+                  id="firstName"
+                  type="text"
+                  placeholder="First name"
+                  value={firstName}
+                  onChange={e => setFirstName(e.target.value)}
+                  disabled={loading}
+                />
+              </div>
+              <div>
+                <Label htmlFor="lastName">Last name (optional)</Label>
+                <Input
+                  id="lastName"
+                  type="text"
+                  placeholder="Last name"
+                  value={lastName}
+                  onChange={e => setLastName(e.target.value)}
+                  disabled={loading}
+                />
+              </div>
             </div>
             <div>
               <Label htmlFor="email">Email</Label>
@@ -214,23 +224,19 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
               </Select>
             </div>
             <div>
-              <Label htmlFor="message">How can we help?</Label>
+              <Label htmlFor="message">How can we help? (optional)</Label>
               <Textarea
                 id="message"
                 placeholder="Share the details so our team can jump in prepared."
                 value={message}
                 onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setMessage(e.target.value)}
-                required={!agentsOnline}
                 disabled={loading}
-                rows={agentsOnline ? 4 : 5}
+                rows={4}
                 maxLength={1000}
-                minLength={!agentsOnline ? 10 : undefined}
               />
               <div className="mt-1 flex justify-between text-[10px] text-muted-foreground">
                 <span>
-                  {agentsOnline
-                    ? 'Optional but helpful—agents will see this as soon as they join.'
-                    : 'Provide as much detail as possible so we can follow up quickly.'}
+                  Optional but helpful—our bot will assist you.
                 </span>
                 <span>{message.length}/1000</span>
               </div>
@@ -248,12 +254,10 @@ export default function PreChatForm({ onSessionStarted }: PreChatFormProps) {
           <Button
             type="submit"
             className="w-full"
-            disabled={
-              loading || (!agentsOnline && message.trim().length < 10)
-            }
+            disabled={loading}
           >
             {loading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
-            {agentsOnline ? 'Start Chat' : 'Send Message'}
+            Start Chat
           </Button>
         </CardFooter>
       </form>

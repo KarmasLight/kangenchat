@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, AgentRole } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 
 const prisma = new PrismaClient();
@@ -24,7 +24,7 @@ async function main() {
         password: passwordHash,
         name,
         displayName: existing.displayName || name,
-        isAdmin: true,
+        role: AgentRole.ADMIN,
       },
     });
     console.log(`Updated existing admin agent: ${updated.email}`);
@@ -35,7 +35,7 @@ async function main() {
         password: passwordHash,
         name,
         displayName: name,
-        isAdmin: true,
+        role: AgentRole.ADMIN,
         status: 'ONLINE',
       },
     });
