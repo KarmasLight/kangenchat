@@ -7,6 +7,7 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import cors from 'cors';
 import nodemailer from 'nodemailer';
+import { Status, AgentRole, type Prisma } from '@prisma/client';
 import { randomBytes, createHash } from 'crypto';
 import { isM365AgentEnabled, startM365Conversation, sendMessageToM365 } from './m365AgentClient';
 
@@ -26,6 +27,9 @@ const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
 const EMAIL_FROM = process.env.EMAIL_FROM || 'no-reply@localhost';
 const MIN_PASSWORD_LENGTH = 8;
+const MAIL_SECRET_TOKEN_TTL_SECONDS = 10 * 60; // 10 minutes
+const MAIL_SECRET_HEADER = 'x-mail-secret-token';
+const MAIL_SECRET_SCOPE = 'mail-secret';
 const PASSWORD_RESET_TOKEN_EXP_MINUTES = (() => {
   const raw = parseInt(process.env.PASSWORD_RESET_TOKEN_EXP_MINUTES ?? '60', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 60;
@@ -92,6 +96,7 @@ type MailConfig = {
   user: string | null;
   password: string | null;
   fromAddress: string | null;
+  transcriptIntro: string | null;
 };
 
 const resolveMailConfig = async (): Promise<MailConfig> => {
@@ -103,7 +108,8 @@ const resolveMailConfig = async (): Promise<MailConfig> => {
     const user = db?.user || SMTP_USER || null;
     const password = db?.password || SMTP_PASS || null;
     const fromAddress = db?.fromAddress || EMAIL_FROM || null;
-    return { host, port, secure, user, password, fromAddress };
+    const transcriptIntro = db?.transcriptIntro || null;
+    return { host, port, secure, user, password, fromAddress, transcriptIntro };
   } catch (err) {
     console.error('resolveMailConfig error', err);
     return {
@@ -113,6 +119,7 @@ const resolveMailConfig = async (): Promise<MailConfig> => {
       user: SMTP_USER || null,
       password: SMTP_PASS || null,
       fromAddress: EMAIL_FROM || null,
+      transcriptIntro: null,
     };
   }
 };
@@ -133,13 +140,53 @@ const getEmailTransporter = async () => {
 
 // Helpers
 type JwtAgentPayload = { agentId: string };
-const authMiddleware = (req: any, res: any, next: any) => {
+type AuthenticatedRequest = express.Request & { agentId?: string };
+type MailSecretTokenPayload = { agentId: string; scope: typeof MAIL_SECRET_SCOPE; iat: number; exp: number };
+
+const signMailSecretToken = (agentId: string) =>
+  jwt.sign({ agentId, scope: MAIL_SECRET_SCOPE } as const, JWT_SECRET, {
+    expiresIn: MAIL_SECRET_TOKEN_TTL_SECONDS,
+  });
+
+const ensureMailSecretAccess = async (
+  req: AuthenticatedRequest,
+  res: express.Response,
+  existing?: { integrationSecretHash: string | null } | null
+): Promise<{ ok: boolean; hasSecret: boolean }> => {
+  const record =
+    existing ??
+    (await prisma.mailSettings.findUnique({
+      where: { id: 'default' },
+      select: { integrationSecretHash: true },
+    }));
+  const hasSecret = Boolean(record?.integrationSecretHash);
+  if (!hasSecret) return { ok: true, hasSecret: false };
+
+  const token = (req.headers[MAIL_SECRET_HEADER] as string | undefined) ?? null;
+  if (!token) {
+    res.status(423).json({ error: 'Mail settings locked', hasSecret: true });
+    return { ok: false, hasSecret: true };
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as MailSecretTokenPayload;
+    if (payload.scope !== MAIL_SECRET_SCOPE || payload.agentId !== req.agentId) {
+      res.status(401).json({ error: 'Invalid mail secret token', hasSecret: true });
+      return { ok: false, hasSecret: true };
+    }
+    return { ok: true, hasSecret: true };
+  } catch {
+    res.status(401).json({ error: 'Invalid mail secret token', hasSecret: true });
+    return { ok: false, hasSecret: true };
+  }
+};
+
+const authMiddleware: express.RequestHandler = (req, res, next) => {
   const auth = req.headers.authorization as string | undefined;
   if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
   const token = auth.slice('Bearer '.length);
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as JwtAgentPayload;
-    (req as any).agentId = decoded.agentId;
+    (req as AuthenticatedRequest).agentId = decoded.agentId;
     next();
   } catch {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -148,10 +195,10 @@ const authMiddleware = (req: any, res: any, next: any) => {
 
 const requireAdmin: express.RequestHandler = async (req, res, next) => {
   try {
-    const agentId = (req as any).agentId as string | undefined;
+    const agentId = (req as AuthenticatedRequest).agentId;
     if (!agentId) return res.status(401).json({ error: 'Unauthorized' });
-    const agent = await prisma.agent.findUnique({ where: { id: agentId }, select: { isAdmin: true } });
-    if (!agent?.isAdmin) return res.status(403).json({ error: 'Forbidden' });
+    const agent = await prisma.agent.findUnique({ where: { id: agentId }, select: { role: true } });
+    if (!agent || agent.role !== AgentRole.ADMIN) return res.status(403).json({ error: 'Forbidden' });
     return next();
   } catch (err) {
     console.error('requireAdmin error', err);
@@ -220,16 +267,449 @@ app.get('/agents/online', async (_req, res) => {
   res.json({ online: count > 0, count });
 });
 
+app.get('/sessions', authMiddleware, async (req, res) => {
+  const agentId = (req as any).agentId as string | undefined;
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const statusRaw = typeof req.query.status === 'string' ? req.query.status.trim().toUpperCase() : '';
+  const assignedRaw = (req.query.assigned as string | undefined)?.toLowerCase();
+  const takeRaw = parseInt((req.query.take as string | undefined) ?? '25', 10);
+  const take = Number.isFinite(takeRaw) ? Math.min(Math.max(takeRaw, 1), 200) : 25;
+
+  const where: Prisma.ChatSessionWhereInput = {};
+  if (statusRaw === 'OPEN' || statusRaw === 'CLOSED') {
+    where.status = statusRaw as Status;
+  }
+
+  if (assignedRaw === 'me') {
+    if (!agentId) return res.status(401).json({ error: 'Unauthorized' });
+    where.agentId = agentId;
+  } else if (assignedRaw === 'unassigned') {
+    where.agentId = null;
+  } else if (assignedRaw === 'assigned') {
+    where.agentId = { not: null };
+  }
+
+  if (q) {
+    where.OR = [
+      { issueType: { contains: q, mode: 'insensitive' } },
+      {
+        visitor: {
+          is: {
+            OR: [
+              { name: { contains: q, mode: 'insensitive' } },
+              { email: { contains: q, mode: 'insensitive' } },
+            ],
+          },
+        },
+      },
+      { messages: { some: { content: { contains: q, mode: 'insensitive' } } } },
+    ];
+  }
+
+  const sessions = await prisma.chatSession.findMany({
+    where,
+    orderBy: [{ updatedAt: 'desc' }],
+    take,
+    select: {
+      id: true,
+      status: true,
+      issueType: true,
+      closedReason: true,
+      closedAt: true,
+      offlineHandledAt: true,
+      createdAt: true,
+      updatedAt: true,
+      visitor: { select: { id: true, name: true, email: true } },
+      agent: { select: { id: true, name: true, email: true, displayName: true } },
+      messages: {
+        orderBy: { createdAt: 'desc' },
+        take: 1,
+        select: { content: true, role: true, createdAt: true },
+      },
+    },
+  });
+
+  res.json({ sessions });
+});
+
+app.post('/sessions/take-next', authMiddleware, async (req, res) => {
+  const agentId = (req as any).agentId as string | undefined;
+  if (!agentId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const claimedSessionId = await prisma.$transaction(async (tx) => {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const next = await tx.chatSession.findFirst({
+          where: {
+            status: 'OPEN',
+            agentId: null,
+            botConversationId: null,
+          },
+          orderBy: { createdAt: 'asc' },
+          select: { id: true },
+        });
+        if (!next?.id) return null;
+
+        const updated = await tx.chatSession.updateMany({
+          where: { id: next.id, status: 'OPEN', agentId: null },
+          data: { agentId },
+        });
+        if (updated.count === 1) {
+          await tx.sessionAssignment.create({ data: { sessionId: next.id, agentId } });
+          return next.id;
+        }
+      }
+      return null;
+    });
+
+    if (!claimedSessionId) return res.status(404).json({ error: 'No unassigned chats available' });
+
+    const agent = await prisma.agent.findUnique({
+      where: { id: agentId },
+      select: { id: true, name: true, email: true, displayName: true },
+    });
+
+    io.to(sessionRoom(claimedSessionId)).emit('agent_joined', { sessionId: claimedSessionId, agent });
+    io.to(agentsRoom).emit('session_assigned', { sessionId: claimedSessionId, agent });
+
+    const room = sessionRoom(claimedSessionId);
+    try {
+      const socketsInRoom = io.sockets.adapter.rooms.get(room);
+      if (socketsInRoom) {
+        for (const sid of socketsInRoom) {
+          const s = io.sockets.sockets.get(sid);
+          if (s && s.data?.agentId && s.data.agentId !== agentId) {
+            s.leave(room);
+          }
+        }
+      }
+      for (const [sid, s] of io.sockets.sockets) {
+        if (s.data?.agentId === agentId) {
+          s.join(room);
+        }
+      }
+    } catch (err) {
+      console.error('take-next sockets sync error', err);
+    }
+
+    const session = await prisma.chatSession.findUnique({
+      where: { id: claimedSessionId },
+      select: {
+        id: true,
+        status: true,
+        issueType: true,
+        closedReason: true,
+        closedAt: true,
+        offlineHandledAt: true,
+        createdAt: true,
+        updatedAt: true,
+        visitor: { select: { id: true, name: true, email: true } },
+        agent: { select: { id: true, name: true, email: true, displayName: true } },
+        messages: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: { content: true, role: true, createdAt: true },
+        },
+      },
+    });
+
+    return res.json({ ok: true, session });
+  } catch (err) {
+    console.error('take-next error', err);
+    return res.status(500).json({ error: 'Failed to take next chat' });
+  }
+});
+
+const buildVisitorName = (firstName?: string, lastName?: string, name?: string) => {
+  const f = typeof firstName === 'string' ? firstName.trim() : '';
+  const l = typeof lastName === 'string' ? lastName.trim() : '';
+  const combined = `${f} ${l}`.trim();
+  if (combined) return combined;
+  const legacy = typeof name === 'string' ? name.trim() : '';
+  return legacy || undefined;
+};
+
+const NAME_STOP_WORDS = new Set([
+  'a',
+  'an',
+  'and',
+  'are',
+  'agent',
+  'am',
+  'be',
+  'because',
+  'but',
+  'call',
+  'called',
+  'can',
+  'cannot',
+  'cant',
+  'could',
+  'do',
+  'dont',
+  'for',
+  'from',
+  'hello',
+  'help',
+  'hey',
+  'hi',
+  'how',
+  'im',
+  'i',
+  'is',
+  'its',
+  'ive',
+  'live',
+  'me',
+  'my',
+  'name',
+  'need',
+  'never',
+  'no',
+  'not',
+  'please',
+  'so',
+  'thanks',
+  'thank',
+  'then',
+  'this',
+  'to',
+  'want',
+  'wanna',
+  'what',
+  'when',
+  'where',
+  'who',
+  'why',
+  'with',
+  'wont',
+  'would',
+  'you',
+  'your',
+]);
+
+const NAME_LEAD_IN_WORDS = new Set(['my', 'name', 'is', 'im', 'i', 'am', 'this', 'its', 'it', 'call', 'called', 'me']);
+const NAME_BOUNDARY_WORDS = new Set(['and', 'but', 'because', 'so', 'then', 'from', 'with', 'for', 'thanks', 'thank']);
+
+const normalizeTokenKey = (word: string) => word.toLowerCase().replace(/[^a-z]/g, '');
+
+const capitalizeWord = (word: string) => {
+  if (!word) return '';
+  return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+};
+
+const extractNameFromMessage = (input: string): { first: string; fullName: string } | null => {
+  if (!input) return null;
+  const cleaned = input.replace(/[^a-zA-Z\s'-]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return null;
+  const rawTokens = cleaned.split(' ').filter(Boolean);
+  if (rawTokens.length < 2) return null;
+  const tokens = [...rawTokens];
+  while (tokens.length && NAME_LEAD_IN_WORDS.has(normalizeTokenKey(tokens[0]))) {
+    tokens.shift();
+  }
+  if (tokens.length < 2) return null;
+  const nameTokens: string[] = [];
+  for (const token of tokens) {
+    const normalizedKey = normalizeTokenKey(token);
+    if (!normalizedKey) continue;
+    if (NAME_BOUNDARY_WORDS.has(normalizedKey)) break;
+    if (!/^[a-zA-Z][a-zA-Z'-]*$/.test(token)) continue;
+    nameTokens.push(token);
+    if (nameTokens.length === 4) break;
+  }
+  if (nameTokens.length < 2) return null;
+  const normalized = nameTokens.map(capitalizeWord);
+  const stopwordHits = normalized.filter((word) => NAME_STOP_WORDS.has(normalizeTokenKey(word)));
+  if (stopwordHits.length > 0) return null;
+  const [first, ...rest] = normalized;
+  if (!first || rest.length === 0) return null;
+  const fullName = `${first} ${rest.join(' ')}`.trim();
+  return { first, fullName };
+};
+
+const QUICK_REPLY_LABELS = new Set(
+  ['order status', 'warranty & repairs', 'warranty and repairs', 'machine setup'].map((label) => label.trim().toLowerCase())
+);
+
+const isQuickReplyMessage = (content: string | undefined | null) => {
+  if (!content) return false;
+  return QUICK_REPLY_LABELS.has(content.trim().toLowerCase());
+};
+
+const EMAIL_REGEX = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+const EMAIL_VALIDATION_REGEX = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
+const PHONE_REGEX = /(\+?\d[\d\s().-]{6,}\d)/;
+const PHONE_VALIDATION_REGEX = /^\+?\d{10,15}$/;
+
+const extractEmailFromMessage = (input: string): string | null => {
+  if (!input) return null;
+  const matches = input.match(EMAIL_REGEX);
+  if (!matches || matches.length === 0) return null;
+  const email = matches[0].trim().toLowerCase();
+  return EMAIL_VALIDATION_REGEX.test(email) ? email : null;
+};
+
+const normalizePhoneNumber = (raw: string): string => {
+  if (!raw) return raw;
+  let normalized = raw.trim();
+  normalized = normalized.replace(/[^\d+]/g, '');
+  if (normalized.startsWith('00')) {
+    normalized = `+${normalized.slice(2)}`;
+  }
+  return normalized;
+};
+
+const extractPhoneFromMessage = (input: string): string | null => {
+  if (!input) return null;
+  const match = input.match(PHONE_REGEX);
+  if (!match) return null;
+  const normalized = normalizePhoneNumber(match[1]);
+  return PHONE_VALIDATION_REGEX.test(normalized) ? normalized : null;
+};
+
+const isValidEmail = (value?: string | null) => Boolean(value && EMAIL_VALIDATION_REGEX.test(value));
+const isValidPhone = (value?: string | null) => Boolean(value && PHONE_VALIDATION_REGEX.test(normalizePhoneNumber(value)));
+
+const looksLikeEmailInput = (input: string): boolean => Boolean(input && input.includes('@'));
+const looksLikePhoneInput = (input: string): boolean => {
+  if (!input) return false;
+  const match = input.match(PHONE_REGEX);
+  if (!match) return false;
+  const normalized = normalizePhoneNumber(match[1]);
+  return normalized.length >= 7;
+};
+
+const hintedPhoneInput = (input: string): boolean => {
+  if (!input) return false;
+  const digits = input.replace(/\D/g, '');
+  return digits.length >= 3;
+};
+
+const requiresName = (session: { visitor?: { name?: string | null } | null }) => !session.visitor?.name;
+
+const hasContactEmail = (session: { visitor?: { email?: string | null } | null }) =>
+  isValidEmail(session.visitor?.email ?? null);
+
+const hasContactPhone = (session: { contactPhone?: string | null; visitor?: { phone?: string | null } | null }) => {
+  const candidate = session.contactPhone || session.visitor?.phone || null;
+  return isValidPhone(candidate);
+};
+
+const markInitialEmailRequested = async (sessionId: string) => {
+  const requestedAt = new Date();
+  await prisma.chatSession.update({
+    where: { id: sessionId },
+    data: { initialEmailRequestedAt: requestedAt },
+  });
+  return requestedAt;
+};
+
+const markInitialPhoneRequested = async (sessionId: string) => {
+  const requestedAt = new Date();
+  await prisma.chatSession.update({
+    where: { id: sessionId },
+    data: { initialPhoneRequestedAt: requestedAt },
+  });
+  return requestedAt;
+};
+
+const promptForContactEmail = async (sessionId: string) => {
+  const requestedAt = await markInitialEmailRequested(sessionId);
+  await sendAgentSystemMessage(
+    sessionId,
+    "Before I loop in a teammate, what's the best email address to send updates?"
+  );
+  return requestedAt;
+};
+
+const promptForContactPhone = async (sessionId: string) => {
+  const requestedAt = await markInitialPhoneRequested(sessionId);
+  await sendAgentSystemMessage(
+    sessionId,
+    'Thanks! Could you also share the best phone number to reach you in case we get disconnected?'
+  );
+  return requestedAt;
+};
+
+const remindEmailNeeded = async (sessionId: string, alreadyRequested: boolean) => {
+  if (alreadyRequested) {
+    await sendAgentSystemMessage(sessionId, 'I still need an email address before I can bring in a live agent.');
+    return null;
+  }
+  return promptForContactEmail(sessionId);
+};
+
+const remindPhoneNeeded = async (sessionId: string, alreadyRequested: boolean) => {
+  if (alreadyRequested) {
+    await sendAgentSystemMessage(sessionId, 'Please drop a phone number we can reach you at so I can connect you.');
+    return null;
+  }
+  return promptForContactPhone(sessionId);
+};
+
+const needsEmail = (session: { visitor?: { email?: string | null } | null }) => !hasContactEmail(session);
+
+const needsPhone = (session: { contactPhone?: string | null; visitor?: { phone?: string | null } | null }) =>
+  !hasContactPhone(session);
+
+const LIVE_AGENT_KEYWORDS = [
+  'live agent',
+  'human agent',
+  'human help',
+  'real person',
+  'speak to an agent',
+  'talk to an agent',
+  'need live help',
+  'need agent help',
+  'connect me to an agent',
+  'talk to a person',
+];
+
+const shouldAutoRequestHandoff = (message: string): boolean => {
+  if (!message) return false;
+  const normalized = message.toLowerCase();
+  return LIVE_AGENT_KEYWORDS.some((keyword) => normalized.includes(keyword));
+};
+
+const requestHandoffForSession = async (sessionId: string) => {
+  const session = await prisma.chatSession.findUnique({
+    where: { id: sessionId },
+    select: { id: true, createdAt: true, botMode: true, agentId: true, status: true },
+  });
+  if (!session) throw new Error('Session not found');
+  if (session.status !== 'OPEN') throw new Error('Session is not open');
+  const alreadyAssigned = Boolean(session.agentId);
+  if (session.botMode !== 'HUMAN') {
+    await prisma.chatSession.update({ where: { id: sessionId }, data: { botMode: 'HUMAN' } });
+  }
+  let queuePosition = 0;
+  if (!alreadyAssigned) {
+    const waitingSessions = await prisma.chatSession.findMany({
+      where: { status: 'OPEN', botMode: 'HUMAN', agentId: null },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true },
+    });
+    const index = waitingSessions.findIndex((s) => s.id === sessionId);
+    queuePosition = index >= 0 ? index + 1 : waitingSessions.length > 0 ? waitingSessions.length : 1;
+    io.to(agentsRoom).emit('new_chat_available', { sessionId });
+  }
+  return { queuePosition, alreadyAssigned };
+};
+
 // POST /sessions: create a pending session (for widget pre-chat)
 app.post('/sessions', async (req, res) => {
-  const { visitorId, message, issueType, name, email } = req.body as {
+  const { visitorId, message, issueType, firstName, lastName, name, email } = req.body as {
     visitorId?: string;
     message?: string;
     issueType?: string;
+    firstName?: string;
+    lastName?: string;
     name?: string;
     email?: string };
-  console.log('[HTTP] POST /sessions body', { hasVisitorId: !!visitorId, hasMessage: !!message, issueType, name, email });
-  const visitor = await prisma.visitor.create({ data: { name, email } });
+  const visitorName = buildVisitorName(firstName, lastName, name);
+  console.log('[HTTP] POST /sessions body', { hasVisitorId: !!visitorId, hasMessage: !!message, issueType, name: visitorName, email });
+  const visitor = await prisma.visitor.create({ data: { name: visitorName, email } });
 
   let botConversationId: string | null = null;
   if (isM365AgentEnabled) {
@@ -251,6 +731,20 @@ app.post('/sessions', async (req, res) => {
     select: { id: true, visitorId: true, issueType: true, status: true, createdAt: true },
   });
   const trimmed = typeof message === 'string' ? message.trim() : '';
+  await prisma.message.createMany({
+    data: [
+      {
+        chatSessionId: session.id,
+        role: 'AGENT',
+        content: 'Hello! Welcome to Kangen Care Bot.',
+      },
+      {
+        chatSessionId: session.id,
+        role: 'AGENT',
+        content: 'May I have your first and last name?',
+      },
+    ],
+  });
   if (trimmed.length > 0) {
     await prisma.message.create({
       data: { chatSessionId: session.id, role: 'USER', content: trimmed },
@@ -324,8 +818,54 @@ app.post('/admin/agents/:id/logout', authMiddleware, requireAdmin, async (req, r
   }
 });
 
+// Admin: delete an agent
+app.delete('/admin/agents/:id', authMiddleware, requireAdmin, async (req, res) => {
+  const targetId = req.params.id;
+  try {
+    if ((req as AuthenticatedRequest).agentId === targetId) {
+      return res.status(400).json({ error: 'You cannot delete your own account' });
+    }
+    const existing = await prisma.agent.findUnique({
+      where: { id: targetId },
+      select: { id: true },
+    });
+    if (!existing) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.chatSession.updateMany({
+        where: { agentId: targetId },
+        data: { agentId: null },
+      });
+      await tx.message.updateMany({
+        where: { agentId: targetId },
+        data: { agentId: null },
+      });
+      await tx.sessionAssignment.deleteMany({
+        where: { agentId: targetId },
+      });
+      await tx.agentDepartment.deleteMany({
+        where: { agentId: targetId },
+      });
+      await tx.passwordResetToken.deleteMany({
+        where: { agentId: targetId },
+      });
+      await tx.agent.delete({ where: { id: targetId } });
+    });
+
+    forceLogoutAgent(targetId).catch(() => {});
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('admin agent delete error', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Admin: view current mail / SMTP settings (DB overrides env, but env used as fallback)
-app.get('/admin/mail-settings', authMiddleware, requireAdmin, async (_req, res) => {
+app.get('/admin/mail-settings', authMiddleware, requireAdmin, async (req, res) => {
+  const guard = await ensureMailSecretAccess(req as AuthenticatedRequest, res);
+  if (!guard.ok) return;
   try {
     const db = await prisma.mailSettings.findUnique({ where: { id: 'default' } });
     const cfg = await resolveMailConfig();
@@ -335,7 +875,9 @@ app.get('/admin/mail-settings', authMiddleware, requireAdmin, async (_req, res) 
       secure: typeof db?.secure === 'boolean' ? db.secure : cfg.secure,
       user: db?.user ?? cfg.user ?? '',
       fromAddress: db?.fromAddress ?? cfg.fromAddress ?? '',
+      transcriptIntro: db?.transcriptIntro ?? cfg.transcriptIntro ?? '',
       hasPassword: Boolean(db?.password || cfg.password),
+      requiresSecret: guard.hasSecret,
     });
   } catch (err) {
     console.error('get /admin/mail-settings error', err);
@@ -345,13 +887,16 @@ app.get('/admin/mail-settings', authMiddleware, requireAdmin, async (_req, res) 
 
 // Admin: update mail / SMTP settings
 app.put('/admin/mail-settings', authMiddleware, requireAdmin, async (req, res) => {
-  const { host, port, secure, user, password, fromAddress } = req.body as {
+  const guard = await ensureMailSecretAccess(req as AuthenticatedRequest, res);
+  if (!guard.ok) return;
+  const { host, port, secure, user, password, fromAddress, transcriptIntro } = req.body as {
     host?: string | null;
     port?: number | null;
     secure?: boolean | null;
     user?: string | null;
     password?: string | null;
     fromAddress?: string | null;
+    transcriptIntro?: string | null;
   };
   try {
     const data: any = {
@@ -360,20 +905,70 @@ app.put('/admin/mail-settings', authMiddleware, requireAdmin, async (req, res) =
       secure: typeof secure === 'boolean' ? secure : false,
       user: user && user.trim().length > 0 ? user.trim() : null,
       fromAddress: fromAddress && fromAddress.trim().length > 0 ? fromAddress.trim() : null,
+      transcriptIntro: transcriptIntro && transcriptIntro.trim().length > 0 ? transcriptIntro.trim() : null,
     };
     if (typeof password === 'string' && password.trim().length > 0) {
       data.password = password;
     }
+    const createData = { id: 'default', ...data };
     await prisma.mailSettings.upsert({
       where: { id: 'default' },
       update: data,
-      create: { id: 'default', ...data },
+      create: createData,
     });
-    res.json({ ok: true });
+    res.json({ ok: true, requiresSecret: guard.hasSecret });
   } catch (err) {
     console.error('put /admin/mail-settings error', err);
     res.status(500).json({ error: 'Failed to save mail settings' });
   }
+});
+
+app.post('/admin/mail-settings/unlock', authMiddleware, requireAdmin, async (req, res) => {
+  const { secret } = req.body as { secret?: string };
+  if (!secret || secret.trim().length === 0) {
+    return res.status(400).json({ error: 'Integration password required' });
+  }
+  const record = await prisma.mailSettings.findUnique({
+    where: { id: 'default' },
+    select: { integrationSecretHash: true },
+  });
+  if (!record?.integrationSecretHash) {
+    return res.status(404).json({ error: 'Integration password not configured' });
+  }
+  const ok = await bcrypt.compare(secret, record.integrationSecretHash);
+  if (!ok) return res.status(401).json({ error: 'Invalid integration password' });
+  const agentId = (req as AuthenticatedRequest).agentId!;
+  const token = signMailSecretToken(agentId);
+  res.json({ token, expiresIn: MAIL_SECRET_TOKEN_TTL_SECONDS });
+});
+
+app.put('/admin/mail-settings/secret', authMiddleware, requireAdmin, async (req, res) => {
+  const { secret, currentSecret } = req.body as { secret?: string; currentSecret?: string | null };
+  if (!secret || secret.trim().length < 8) {
+    return res.status(400).json({ error: 'Integration password must be at least 8 characters' });
+  }
+  const record = await prisma.mailSettings.findUnique({
+    where: { id: 'default' },
+    select: { integrationSecretHash: true },
+  });
+  const hasSecret = Boolean(record?.integrationSecretHash);
+  if (hasSecret) {
+    let authorized = false;
+    if (currentSecret && record?.integrationSecretHash) {
+      authorized = await bcrypt.compare(currentSecret, record.integrationSecretHash);
+    }
+    if (!authorized) {
+      const guard = await ensureMailSecretAccess(req as AuthenticatedRequest, res, record);
+      if (!guard.ok) return;
+    }
+  }
+  const hashed = await bcrypt.hash(secret.trim(), 12);
+  await prisma.mailSettings.upsert({
+    where: { id: 'default' },
+    update: { integrationSecretHash: hashed },
+    create: { id: 'default', integrationSecretHash: hashed },
+  });
+  res.json({ ok: true, requiresSecret: true });
 });
 
 // GET /sessions/:id: fetch session with visitor (for agents)
@@ -445,19 +1040,34 @@ app.post('/transcripts/email', async (req, res) => {
   });
 
   const { transporter, config } = await getEmailTransporter();
-  if (!transporter) {
-    return res.status(503).json({ error: 'Email service not configured' });
+  if (!transporter || !config.user || !config.password || !config.host) {
+    console.error('transcripts/email missing SMTP config', { host: config.host, user: config.user });
+    return res
+      .status(503)
+      .json({ error: 'Email service not configured. Check SMTP host, username, password, and from address.' });
   }
   const subject = `Chat transcript ${sessionId}`;
+  const intro = config.transcriptIntro?.trim();
+  const textBody = intro ? `${intro}\n\n${built.text}` : built.text;
+  let htmlBody = built.html;
+  if (intro) {
+    const safeIntro = `<p>${escapeHtml(intro)}</p>`;
+    if (htmlBody.includes('<hr/>')) {
+      htmlBody = htmlBody.replace('<hr/>', `${safeIntro}<hr/>`);
+    } else {
+      htmlBody = htmlBody.replace('</body>', `${safeIntro}</body>`);
+    }
+  }
   try {
     await transporter.sendMail({
-      from: config.fromAddress || EMAIL_FROM,
+      from: config.fromAddress || EMAIL_FROM || config.user,
       to: emailTarget,
       subject,
-      text: built.text,
-      html: built.html,
+      text: textBody,
+      html: htmlBody,
     });
   } catch (e) {
+    console.error('transcripts/email sendMail error', e);
     return res.status(502).json({ error: 'Failed to send email' });
   }
   res.json({ ok: true });
@@ -465,8 +1075,19 @@ app.post('/transcripts/email', async (req, res) => {
 
 // POST /offline/message: store offline message for follow-up
 app.post('/offline/message', async (req, res) => {
-  const { name, email, issueType, message } = req.body as { name?: string; email?: string; issueType?: string; message: string };
-  const visitor = await prisma.visitor.create({ data: { name, email } });
+  const { firstName, lastName, name, email, issueType, message } = req.body as {
+    firstName?: string;
+    lastName?: string;
+    name?: string;
+    email?: string;
+    issueType?: string;
+    message: string;
+  };
+  if (!email || typeof email !== 'string' || !email.trim()) {
+    return res.status(400).json({ error: 'Email is required for offline messages' });
+  }
+  const visitorName = buildVisitorName(firstName, lastName, name);
+  const visitor = await prisma.visitor.create({ data: { name: visitorName, email } });
   // Store as a closed session with an initial message
   const session = await prisma.chatSession.create({
     data: { visitorId: visitor.id, issueType, status: 'CLOSED', closedReason: 'OFFLINE_MESSAGE', closedAt: new Date() },
@@ -631,24 +1252,44 @@ app.post('/offline/messages/:id/handle', authMiddleware, async (req: any, res) =
   res.json(updated);
 });
 
-// Registration endpoint
-app.post('/register', async (req, res) => {
-  const { email, password, name, displayName, phone, avatarUrl } = req.body as {
-    email: string; password: string; name: string; displayName?: string; phone?: string; avatarUrl?: string;
+// Agent account creation (admin-only)
+app.post('/register', authMiddleware, requireAdmin, async (req, res) => {
+  const { email, password, name, displayName, phone, avatarUrl, role } = req.body as {
+    email?: string;
+    password?: string;
+    name?: string;
+    displayName?: string;
+    phone?: string;
+    avatarUrl?: string;
+    role?: string;
   };
-  if (!email || !password || !name) return res.status(400).json({ error: 'Missing required fields' });
+  const trimmedEmail = email?.trim();
+  const trimmedName = name?.trim();
+  if (!trimmedEmail || !password || !trimmedName) return res.status(400).json({ error: 'Missing required fields' });
   if (!isPasswordValid(password)) {
     return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
   }
-  const existing = await prisma.agent.findUnique({ where: { email }, select: { id: true } });
+  const normalizedRole = typeof role === 'string' ? role.trim().toUpperCase() : null;
+  const requestedRole =
+    normalizedRole && (normalizedRole === AgentRole.ADMIN || normalizedRole === AgentRole.MANAGER)
+      ? (normalizedRole as AgentRole)
+      : AgentRole.AGENT;
+  const existing = await prisma.agent.findUnique({ where: { email: trimmedEmail }, select: { id: true } });
   if (existing) return res.status(409).json({ error: 'Email already registered' });
   const hashed = await bcrypt.hash(password, 10);
   const agent = await prisma.agent.create({
-    data: { email, name, password: hashed, displayName: displayName ?? name, phone, avatarUrl },
-    select: { id: true, email: true, name: true, displayName: true, phone: true, avatarUrl: true, status: true, isAdmin: true }
+    data: {
+      email: trimmedEmail,
+      name: trimmedName,
+      password: hashed,
+      displayName: displayName?.trim() || trimmedName,
+      phone: phone?.trim() || undefined,
+      role: requestedRole,
+      avatarUrl: avatarUrl?.trim() || undefined,
+    },
+    select: { id: true, email: true, name: true, displayName: true, phone: true, avatarUrl: true, status: true, role: true },
   });
-  const token = jwt.sign({ agentId: agent.id }, JWT_SECRET, { expiresIn: '1h' });
-  res.json({ token, agent });
+  res.json({ agent });
 });
 
 // Login endpoint for agents
@@ -668,7 +1309,7 @@ app.post('/login', async (req, res) => {
     phone: agent.phone,
     avatarUrl: agent.avatarUrl,
     status: agent.status,
-    isAdmin: agent.isAdmin,
+    role: agent.role,
   };
   res.json({ token, agent: agentPublic });
 });
@@ -755,7 +1396,7 @@ const emitAgentsDirectory = async () => {
   try {
     const agents = await prisma.agent.findMany({
       orderBy: { displayName: 'asc' },
-      select: { id: true, email: true, name: true, displayName: true, status: true },
+      select: { id: true, email: true, name: true, displayName: true, status: true, role: true },
     });
     io.to(agentsRoom).emit('agents_snapshot', { agents });
   } catch (err) {
@@ -777,6 +1418,17 @@ io.use((socket, next) => {
 
 // Room name helper
 const sessionRoom = (sessionId: string) => `session:${sessionId}`;
+
+const sendAgentSystemMessage = async (sessionId: string, content: string) => {
+  const message = await prisma.message.create({
+    data: { chatSessionId: sessionId, role: 'AGENT', content },
+  });
+  io.to(sessionRoom(sessionId)).emit('new_message', {
+    ...message,
+    sessionId: message.chatSessionId,
+  });
+  return message;
+};
 
 // Agents room to notify available chats
 const agentsRoom = 'agents';
@@ -1054,6 +1706,26 @@ io.on('connection', (socket) => {
             return;
           }
         }
+        const chatSession = await prisma.chatSession.findUnique({
+          where: { id: payload.sessionId },
+          select: {
+            id: true,
+            botConversationId: true,
+            botMode: true,
+            visitorId: true,
+            contactPhone: true,
+            distributorId: true,
+            handoffInfoRequestedAt: true,
+            handoffInfoProvidedAt: true,
+            initialEmailRequestedAt: true,
+            initialPhoneRequestedAt: true,
+            visitor: { select: { id: true, name: true, email: true, phone: true } },
+          },
+        });
+        if (!chatSession) {
+          if (typeof callback === 'function') callback({ error: 'Session not found' });
+          return;
+        }
         const msg = await prisma.message.create({
           data: {
             chatSessionId: payload.sessionId,
@@ -1066,16 +1738,234 @@ io.on('connection', (socket) => {
           ...msg,
           sessionId: msg.chatSessionId,
         });
-        if (payload.role === 'USER' && isM365AgentEnabled) {
+        let parsedName: { first: string; fullName: string } | null = null;
+        const isQuickReply = payload.role === 'USER' ? isQuickReplyMessage(payload.content) : false;
+        const missingName = payload.role === 'USER' && chatSession.visitorId && !chatSession.visitor?.name;
+        if (missingName) {
+          const visitorId = chatSession.visitorId;
+          if (!visitorId) {
+            if (typeof callback === 'function') callback({ error: 'Visitor missing' });
+            return;
+          }
+          if (isQuickReply) {
+            const reminderMsg = await prisma.message.create({
+              data: {
+                chatSessionId: payload.sessionId,
+                role: 'AGENT',
+                content: 'Before we continue, may I have your first and last name?',
+              },
+            });
+            io.to(sessionRoom(payload.sessionId)).emit('new_message', {
+              ...reminderMsg,
+              sessionId: reminderMsg.chatSessionId,
+            });
+            if (typeof callback === 'function') callback({ ok: true });
+            return;
+          }
+          parsedName = extractNameFromMessage(payload.content);
+          if (parsedName) {
+            await prisma.visitor.update({
+              where: { id: visitorId },
+              data: { name: parsedName.fullName },
+            });
+            const greeting = `Nice to meet you, ${parsedName.first}! How can I assist you today?`;
+            const greetingMsg = await prisma.message.create({
+              data: { chatSessionId: payload.sessionId, role: 'AGENT', content: greeting },
+            });
+            io.to(sessionRoom(payload.sessionId)).emit('new_message', {
+              ...greetingMsg,
+              sessionId: greetingMsg.chatSessionId,
+            });
+            chatSession.visitor = {
+              ...(chatSession.visitor ?? { id: visitorId, email: null, phone: null }),
+              name: parsedName.fullName,
+            };
+          } else {
+            const reminderMsg = await prisma.message.create({
+              data: {
+                chatSessionId: payload.sessionId,
+                role: 'AGENT',
+                content: 'Before we continue, may I have your first and last name?',
+              },
+            });
+            io.to(sessionRoom(payload.sessionId)).emit('new_message', {
+              ...reminderMsg,
+              sessionId: reminderMsg.chatSessionId,
+            });
+            if (typeof callback === 'function') callback({ ok: true });
+            return;
+          }
+        }
+        const shouldSkipBotForward = Boolean(parsedName);
+        const sessionHasName = requiresName(chatSession) === false;
+        const needsHandoffInfo = sessionHasName && shouldAutoRequestHandoff(payload.content);
+        console.debug('[send_message] parsedName:', parsedName, 'sessionHasName:', sessionHasName, 'needsHandoffInfo:', needsHandoffInfo, 'content:', payload.content);
+        if (needsHandoffInfo) {
+          const alreadyRequestedInfo = Boolean(chatSession.handoffInfoRequestedAt);
+          if (!alreadyRequestedInfo) {
+            await prisma.chatSession.update({
+              where: { id: payload.sessionId },
+              data: { handoffInfoRequestedAt: new Date(), botMode: 'HUMAN' },
+            });
+            const emailPromptAt = await promptForContactEmail(payload.sessionId);
+            chatSession.initialEmailRequestedAt = emailPromptAt;
+            await sendAgentSystemMessage(
+              payload.sessionId,
+              'Once I have your email, I’ll grab the best phone number to reach you (and distributor ID if you have one).'
+            );
+            io.to(sessionRoom(payload.sessionId)).emit('handoff_status', {
+              sessionId: payload.sessionId,
+              awaitingContactInfo: true,
+            });
+            if (typeof callback === 'function') callback({ ok: true });
+            return;
+          }
+        }
+
+        // After name is captured, collect email (first) and then phone before allowing handoff
+        if (sessionHasName && chatSession.visitorId) {
+          const emailMatch = extractEmailFromMessage(payload.content);
+          if (emailMatch && needsEmail(chatSession)) {
+            await prisma.visitor.update({
+              where: { id: chatSession.visitorId },
+              data: { email: emailMatch },
+            });
+            chatSession.visitor = { ...(chatSession.visitor ?? { id: chatSession.visitorId, name: null, phone: null }), email: emailMatch };
+            await sendAgentSystemMessage(payload.sessionId, 'Thanks! I’ve got your email.');
+            if (needsPhone(chatSession) && !chatSession.initialPhoneRequestedAt) {
+              const phonePromptAt = await promptForContactPhone(payload.sessionId);
+              chatSession.initialPhoneRequestedAt = phonePromptAt;
+            }
+          } else if (!emailMatch && needsEmail(chatSession) && looksLikeEmailInput(payload.content)) {
+            await sendAgentSystemMessage(
+              payload.sessionId,
+              'I couldn’t validate that email. Mind double-checking the spelling so I can pass it to the live agent?'
+            );
+          }
+          const emailReady = !needsEmail(chatSession);
+          const phoneMatch = extractPhoneFromMessage(payload.content);
+          if (emailReady && phoneMatch && needsPhone(chatSession)) {
+            await prisma.chatSession.update({
+              where: { id: payload.sessionId },
+              data: { contactPhone: phoneMatch },
+            });
+            chatSession.contactPhone = phoneMatch;
+            await sendAgentSystemMessage(payload.sessionId, 'Got it—thanks for the phone number.');
+          } else if (!emailReady && phoneMatch && needsPhone(chatSession)) {
+            await sendAgentSystemMessage(
+              payload.sessionId,
+              'Appreciate that! I just need your email first, then I’ll grab the phone number.'
+            );
+          }
+          // If user asked for handoff and we still need email/phone, prompt for them
+          if (needsHandoffInfo) {
+            if (needsEmail(chatSession)) {
+              const emailReminderAt = await remindEmailNeeded(
+                payload.sessionId,
+                Boolean(chatSession.initialEmailRequestedAt)
+              );
+              if (emailReminderAt) chatSession.initialEmailRequestedAt = emailReminderAt;
+            } else if (needsPhone(chatSession)) {
+              const phoneReminderAt = await remindPhoneNeeded(
+                payload.sessionId,
+                Boolean(chatSession.initialPhoneRequestedAt)
+              );
+              if (phoneReminderAt) chatSession.initialPhoneRequestedAt = phoneReminderAt;
+            }
+            if (typeof callback === 'function') callback({ ok: true });
+            return;
+          }
+        }
+
+        if (chatSession.handoffInfoRequestedAt && !chatSession.handoffInfoProvidedAt && chatSession.botMode === 'HUMAN') {
+          const extractedPhone = extractPhoneFromMessage(payload.content);
+          const distributorMatch = payload.content.match(/\b\d{4,}\b/);
+          const alreadyHasValidPhone = hasContactPhone(chatSession);
+          const phoneNowValid = alreadyHasValidPhone || Boolean(extractedPhone);
+
+          if (needsEmail(chatSession)) {
+            const emailReminderAt = await remindEmailNeeded(
+              payload.sessionId,
+              Boolean(chatSession.initialEmailRequestedAt)
+            );
+            if (emailReminderAt) chatSession.initialEmailRequestedAt = emailReminderAt;
+            if (typeof callback === 'function') callback({ ok: true });
+            return;
+          }
+
+          if (!alreadyHasValidPhone && extractedPhone) {
+            await prisma.chatSession.update({
+              where: { id: payload.sessionId },
+              data: { contactPhone: extractedPhone },
+            });
+            chatSession.contactPhone = extractedPhone;
+          }
+
+          if (!phoneNowValid) {
+            if (looksLikePhoneInput(payload.content) || hintedPhoneInput(payload.content)) {
+              await sendAgentSystemMessage(
+                payload.sessionId,
+                'Hmm, that phone number doesn’t look valid. Could you send the full number with country code?'
+              );
+            } else {
+              const phoneReminderAt = await remindPhoneNeeded(
+                payload.sessionId,
+                Boolean(chatSession.initialPhoneRequestedAt)
+              );
+              if (phoneReminderAt) chatSession.initialPhoneRequestedAt = phoneReminderAt;
+            }
+            if (typeof callback === 'function') callback({ ok: true });
+            return;
+          }
+
+          if (distributorMatch) {
+            await prisma.chatSession.update({
+              where: { id: payload.sessionId },
+              data: { distributorId: distributorMatch[0] },
+            });
+            chatSession.distributorId = distributorMatch[0];
+          }
+
+          await prisma.chatSession.update({
+            where: { id: payload.sessionId },
+            data: { handoffInfoProvidedAt: new Date() },
+          });
+          const confirmMsg = await prisma.message.create({
+            data: {
+              chatSessionId: payload.sessionId,
+              role: 'AGENT',
+              content: 'Thank you! I’m connecting you with a live agent now.',
+            },
+          });
+          io.to(sessionRoom(payload.sessionId)).emit('new_message', { ...confirmMsg, sessionId: confirmMsg.chatSessionId });
+          const { queuePosition } = await requestHandoffForSession(payload.sessionId);
+          const queueMsg =
+            typeof queuePosition === 'number'
+              ? queuePosition <= 1
+                ? 'You are next in the queue for a live agent.'
+                : `You are #${queuePosition} in the queue for a live agent.`
+              : 'A live agent will join shortly.';
+          const queueNotice = await prisma.message.create({
+            data: {
+              chatSessionId: payload.sessionId,
+              role: 'AGENT',
+              content: queueMsg,
+            },
+          });
+          io.to(sessionRoom(payload.sessionId)).emit('new_message', { ...queueNotice, sessionId: queueNotice.chatSessionId });
+          io.to(sessionRoom(payload.sessionId)).emit('handoff_status', {
+            sessionId: payload.sessionId,
+            awaitingContactInfo: false,
+            queuePosition,
+          });
+          if (typeof callback === 'function') callback({ ok: true });
+          return;
+        }
+
+        if (payload.role === 'USER' && isM365AgentEnabled && !shouldSkipBotForward) {
           try {
             console.log('[M365] send_message: USER message received for session', payload.sessionId);
-            const chatSession = await prisma.chatSession.findUnique({
-              where: { id: payload.sessionId },
-              select: { id: true, botConversationId: true, botMode: true },
-            });
-            if (!chatSession) {
-              console.log('[M365] send_message: no chatSession found for', payload.sessionId);
-            } else if (!chatSession.botConversationId) {
+            if (!chatSession.botConversationId) {
               console.log('[M365] send_message: session has no botConversationId; skipping bot send', chatSession.id);
             } else if (chatSession.botMode !== 'BOT') {
               console.log('[M365] send_message: botMode is not BOT; current mode =', chatSession.botMode);
@@ -1113,15 +2003,29 @@ io.on('connection', (socket) => {
   // User requests handoff from bot to live agent
   socket.on(
     'request_handoff',
-    async (payload: { sessionId: string }, callback?: (resp: { ok?: boolean; error?: string }) => void) => {
+    async (
+      payload: { sessionId: string },
+      callback?: (resp: { ok?: boolean; error?: string; queuePosition?: number }) => void
+    ) => {
       try {
         const updated = await prisma.chatSession.update({
           where: { id: payload.sessionId },
           data: { botMode: 'HUMAN' },
+          select: { id: true, createdAt: true },
+        });
+
+        // Determine this session's position in the live-agent queue.
+        // Queue consists of OPEN sessions in HUMAN mode with no assigned agent, ordered by createdAt.
+        const waitingSessions = await prisma.chatSession.findMany({
+          where: { status: 'OPEN', botMode: 'HUMAN', agentId: null },
+          orderBy: { createdAt: 'asc' },
           select: { id: true },
         });
+        const index = waitingSessions.findIndex((s) => s.id === updated.id);
+        const queuePosition = index >= 0 ? index + 1 : waitingSessions.length > 0 ? waitingSessions.length : 1;
+
         io.to(agentsRoom).emit('new_chat_available', { sessionId: updated.id });
-        if (typeof callback === 'function') callback({ ok: true });
+        if (typeof callback === 'function') callback({ ok: true, queuePosition });
       } catch (err) {
         console.error('request_handoff error', err);
         if (typeof callback === 'function') callback({ error: 'failed' });
@@ -1204,7 +2108,10 @@ io.on('connection', (socket) => {
 
 // REST endpoints requiring auth
 app.get('/me', authMiddleware, async (req: any, res) => {
-  const me = await prisma.agent.findUnique({ where: { id: req.agentId }, select: { id: true, email: true, name: true, displayName: true, phone: true, avatarUrl: true, status: true } });
+  const me = await prisma.agent.findUnique({
+    where: { id: req.agentId },
+    select: { id: true, email: true, name: true, displayName: true, phone: true, avatarUrl: true, status: true, role: true },
+  });
   if (!me) return res.status(404).json({ error: 'Not found' });
   res.json(me);
 });
@@ -1239,31 +2146,125 @@ app.post('/presence', authMiddleware, async (req: any, res) => {
 // ===== Routing & Directory Endpoints =====
 // List agents (for transfer UI)
 app.get('/agents', authMiddleware, async (_req, res) => {
-  const agents = await prisma.agent.findMany({ select: { id: true, email: true, name: true, displayName: true, status: true } });
+  const agents = await prisma.agent.findMany({
+    select: { id: true, email: true, name: true, displayName: true, status: true, phone: true, role: true },
+  });
   res.json(agents);
 });
 
-// Departments minimal
-app.post('/departments', authMiddleware, async (req, res) => {
-  const { name } = req.body as { name?: string };
-  if (!name) return res.status(400).json({ error: 'name required' });
-  const dept = await prisma.department.create({ data: { name } });
-  res.json(dept);
-});
-
-app.get('/departments', authMiddleware, async (_req, res) => {
-  const depts = await prisma.department.findMany({ orderBy: { name: 'asc' } });
-  res.json(depts);
-});
-
-app.post('/departments/:id/agents', authMiddleware, async (req, res) => {
-  const { agentId } = req.body as { agentId?: string };
-  if (!agentId) return res.status(400).json({ error: 'agentId required' });
+app.put('/agents/:id/role', authMiddleware, requireAdmin, async (req, res) => {
+  const { role } = req.body as { role?: string };
+  const validRoles = ['ADMIN', 'MANAGER', 'AGENT'];
+  if (!role || !validRoles.includes(role)) {
+    return res.status(400).json({ error: 'Valid role required (ADMIN, MANAGER, AGENT)' });
+  }
   try {
-    const map = await prisma.agentDepartment.create({ data: { agentId, departmentId: req.params.id } });
-    res.json(map);
-  } catch (e) {
-    res.status(400).json({ error: 'Failed to assign agent to department' });
+    const agentId = req.params.id;
+    const updated = await prisma.agent.update({
+      where: { id: agentId },
+      data: { role: role as AgentRole },
+      select: { id: true, email: true, name: true, displayName: true, status: true, role: true },
+    });
+    await emitAgentsDirectory();
+    res.json(updated);
+  } catch (err) {
+    console.error('update agent role error', err);
+    res.status(500).json({ error: 'Failed to update agent role' });
+  }
+});
+
+// Departments minimal
+app.post('/departments', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const { name } = req.body as { name?: string };
+    const normalized = name?.trim();
+    if (!normalized) return res.status(400).json({ error: 'name required' });
+    const existing = await prisma.department.findUnique({ where: { name: normalized } });
+    if (existing) return res.status(409).json({ error: 'Department name already exists' });
+    const dept = await prisma.department.create({ data: { name: normalized } });
+    return res.json(dept);
+  } catch (err) {
+    console.error('create department error', err);
+    return res.status(500).json({ error: 'Failed to create department' });
+  }
+});
+
+app.get('/departments', authMiddleware, async (req: any, res) => {
+  try {
+    const agentId = req.agentId as string | undefined;
+    let requesterRole: AgentRole | null = null;
+    if (agentId) {
+      const agent = await prisma.agent.findUnique({ where: { id: agentId }, select: { role: true } });
+      requesterRole = agent?.role ?? null;
+    }
+
+    const query: any = {
+      orderBy: { name: 'asc' },
+    };
+    if (requesterRole === AgentRole.ADMIN) {
+      query.include = {
+        agentDepartments: {
+          include: {
+            agent: { select: { id: true, email: true, name: true, displayName: true, status: true } },
+          },
+        },
+      };
+    }
+
+    const depts = await prisma.department.findMany(query);
+    return res.json(depts);
+  } catch (err) {
+    console.error('list departments error', err);
+    return res.status(500).json({ error: 'Failed to load departments' });
+  }
+});
+
+app.put('/departments/:id', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const departmentId = req.params.id;
+    const { name } = req.body as { name?: string };
+    const normalized = name?.trim();
+    if (!normalized) return res.status(400).json({ error: 'name required' });
+    const existing = await prisma.department.findUnique({ where: { name: normalized } });
+    if (existing && existing.id !== departmentId) {
+      return res.status(409).json({ error: 'Department name already exists' });
+    }
+    const updated = await prisma.department.update({ where: { id: departmentId }, data: { name: normalized } });
+    return res.json(updated);
+  } catch (err) {
+    console.error('rename department error', err);
+    return res.status(500).json({ error: 'Failed to rename department' });
+  }
+});
+
+app.delete('/departments/:id', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const departmentId = req.params.id;
+    await prisma.$transaction([
+      prisma.agentDepartment.deleteMany({ where: { departmentId } }),
+      prisma.department.delete({ where: { id: departmentId } }),
+    ]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('delete department error', err);
+    return res.status(500).json({ error: 'Failed to delete department' });
+  }
+});
+
+app.post('/departments/:id/agents', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const { agentId, available } = req.body as { agentId?: string; available?: boolean };
+    if (!agentId) return res.status(400).json({ error: 'agentId required' });
+    const departmentId = req.params.id;
+    const existing = await prisma.agentDepartment.findFirst({ where: { agentId, departmentId } });
+    if (existing) return res.status(200).json(existing);
+    const map = await prisma.agentDepartment.create({
+      data: { agentId, departmentId, available: available ?? false },
+    });
+    return res.json(map);
+  } catch (err) {
+    console.error('assign agent department error', err);
+    return res.status(500).json({ error: 'Failed to assign agent to department' });
   }
 });
 
@@ -1274,7 +2275,13 @@ app.get('/me/departments', authMiddleware, async (req: any, res) => {
     where: { agentId },
     include: { department: true },
   });
-  res.json(assigned.map((a) => a.department));
+  res.json(
+    assigned.map((a) => ({
+      id: a.department.id,
+      name: a.department.name,
+      available: a.available,
+    }))
+  );
 });
 
 app.post('/departments/:id/agents/me', authMiddleware, async (req: any, res) => {
@@ -1284,9 +2291,21 @@ app.post('/departments/:id/agents/me', authMiddleware, async (req: any, res) => 
     const existing = await prisma.agentDepartment.findFirst({
       where: { agentId, departmentId: req.params.id },
     });
-    if (existing) return res.status(200).json(existing);
-    const map = await prisma.agentDepartment.create({ data: { agentId, departmentId: req.params.id } });
-    res.json(map);
+    if (!existing) {
+      const dept = await prisma.department.findUnique({ where: { id: req.params.id } });
+      if (!dept) return res.status(404).json({ error: 'Department not found' });
+      const map = await prisma.agentDepartment.create({
+        data: { agentId, departmentId: req.params.id, available: true },
+      });
+      res.json(map);
+      return;
+    }
+    if (existing.available) return res.json(existing);
+    const updated = await prisma.agentDepartment.update({
+      where: { id: existing.id },
+      data: { available: true },
+    });
+    res.json(updated);
   } catch (err) {
     console.error('assign self department error', err);
     res.status(500).json({ error: 'Failed to join department' });
@@ -1297,11 +2316,31 @@ app.delete('/departments/:id/agents/me', authMiddleware, async (req: any, res) =
   const agentId = req.agentId as string | undefined;
   if (!agentId) return res.status(401).json({ error: 'Unauthorized' });
   try {
-    await prisma.agentDepartment.deleteMany({ where: { agentId, departmentId: req.params.id } });
+    const existing = await prisma.agentDepartment.findFirst({
+      where: { agentId, departmentId: req.params.id },
+    });
+    if (!existing) return res.status(403).json({ error: 'You are not assigned to this department' });
+    if (!existing.available) return res.json({ ok: true });
+    await prisma.agentDepartment.update({
+      where: { id: existing.id },
+      data: { available: false },
+    });
     res.json({ ok: true });
   } catch (err) {
     console.error('leave department error', err);
     res.status(500).json({ error: 'Failed to leave department' });
+  }
+});
+
+app.delete('/departments/:id/agents/:agentId', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    await prisma.agentDepartment.deleteMany({
+      where: { agentId: req.params.agentId, departmentId: req.params.id },
+    });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('unassign agent department error', err);
+    return res.status(500).json({ error: 'Failed to unassign agent from department' });
   }
 });
 
@@ -1363,17 +2402,141 @@ app.post('/sessions/:id/csat', async (req, res) => {
   }
 });
 
-app.get('/analytics/csat', authMiddleware, async (_req, res) => {
+app.get('/analytics/csat', authMiddleware, async (req, res) => {
   try {
-    const aggregate = await prisma.csatFeedback.aggregate({
-      _avg: { rating: true },
-      _count: { rating: true },
+    const trendWindowDays = (() => {
+      const raw = Number.parseInt((req.query.days as string) ?? '14', 10);
+      if (Number.isNaN(raw)) return 14;
+      return Math.min(Math.max(raw, 3), 90);
+    })();
+    const agentWindowDays = (() => {
+      const raw = Number.parseInt((req.query.agentDays as string) ?? '30', 10);
+      if (Number.isNaN(raw)) return 30;
+      return Math.min(Math.max(raw, 7), 120);
+    })();
+    const now = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const trendStart = new Date(now - (trendWindowDays - 1) * dayMs);
+    const agentWindowStart = new Date(now - agentWindowDays * dayMs);
+
+    const [aggregate, positive, recentFeedback, distributionGroup, agentGroup, firstAssignments] = await Promise.all([
+      prisma.csatFeedback.aggregate({ _avg: { rating: true }, _count: { rating: true } }),
+      prisma.csatFeedback.count({ where: { rating: { gte: 4 } } }),
+      prisma.csatFeedback.findMany({
+        where: { createdAt: { gte: trendStart } },
+        select: { rating: true, createdAt: true },
+      }),
+      prisma.csatFeedback.groupBy({
+        by: ['rating'],
+        _count: { _all: true },
+      }),
+      prisma.chatSession.groupBy({
+        by: ['agentId'],
+        _count: { _all: true },
+        where: {
+          agentId: { not: null },
+          closedAt: { gte: agentWindowStart },
+          status: Status.CLOSED,
+        },
+      }),
+      prisma.sessionAssignment.findMany({
+        where: { assignedAt: { gte: agentWindowStart } },
+        orderBy: { assignedAt: 'asc' },
+        distinct: ['sessionId'],
+        select: {
+          sessionId: true,
+          assignedAt: true,
+          session: {
+            select: { createdAt: true },
+          },
+        },
+      }),
+    ]);
+
+    const distribution: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+    distributionGroup.forEach((group) => {
+      if (group.rating >= 1 && group.rating <= 5) {
+        distribution[group.rating] = group._count._all;
+      }
     });
-    const positive = await prisma.csatFeedback.count({ where: { rating: { gte: 4 } } });
+
+    const trendBuckets = new Map<
+      string,
+      { totalRatings: number; sumRatings: number }
+    >();
+    recentFeedback.forEach((entry) => {
+      const dateKey = entry.createdAt.toISOString().slice(0, 10);
+      const bucket = trendBuckets.get(dateKey) ?? { totalRatings: 0, sumRatings: 0 };
+      bucket.totalRatings += 1;
+      bucket.sumRatings += entry.rating;
+      trendBuckets.set(dateKey, bucket);
+    });
+
+    const trend: { date: string; average: number | null; responses: number }[] = [];
+    for (let i = trendWindowDays - 1; i >= 0; i -= 1) {
+      const dayDate = new Date(now - i * dayMs);
+      const key = dayDate.toISOString().slice(0, 10);
+      const bucket = trendBuckets.get(key);
+      trend.push({
+        date: key,
+        average: bucket && bucket.totalRatings > 0 ? bucket.sumRatings / bucket.totalRatings : null,
+        responses: bucket?.totalRatings ?? 0,
+      });
+    }
+
+    const agentIds = agentGroup.map((group) => group.agentId).filter((id): id is string => Boolean(id));
+    const agents =
+      agentIds.length > 0
+        ? await prisma.agent.findMany({
+            where: { id: { in: agentIds } },
+            select: { id: true, displayName: true, name: true, email: true },
+          })
+        : [];
+    const agentChatCounts = agentGroup
+      .filter((group) => group.agentId)
+      .map((group) => {
+        const agent = agents.find((a) => a.id === group.agentId);
+        const label = agent?.displayName || agent?.name || agent?.email || 'Unknown agent';
+        return {
+          agentId: group.agentId as string,
+          name: label,
+          chatsHandled: group._count._all,
+        };
+      })
+      .sort((a, b) => b.chatsHandled - a.chatsHandled);
+
+    const waitDurationsMinutes = firstAssignments
+      .map((assignment) => {
+        const createdAt = assignment.session?.createdAt;
+        if (!createdAt) return null;
+        const durationMinutes = (assignment.assignedAt.getTime() - createdAt.getTime()) / (60 * 1000);
+        return Number.isFinite(durationMinutes) && durationMinutes >= 0 ? durationMinutes : null;
+      })
+      .filter((value): value is number => value !== null);
+    const averageWaitMinutes =
+      waitDurationsMinutes.length > 0
+        ? waitDurationsMinutes.reduce((sum, value) => sum + value, 0) / waitDurationsMinutes.length
+        : null;
+    const totalWindowMinutes = agentWindowDays * 24 * 60;
+    const arrivalRatePerMinute =
+      totalWindowMinutes > 0 ? firstAssignments.length / totalWindowMinutes : null;
+    const averageQueueSizeEstimate =
+      averageWaitMinutes !== null && arrivalRatePerMinute !== null ? arrivalRatePerMinute * averageWaitMinutes : null;
+
     return res.json({
       average: aggregate._avg.rating ?? null,
       total: aggregate._count.rating,
       positive,
+      distribution,
+      trend,
+      period: {
+        days: trendWindowDays,
+        responses: recentFeedback.length,
+      },
+      agentChatCounts,
+      agentWindowDays,
+      averageWaitMinutes,
+      averageQueueSize: averageQueueSizeEstimate,
     });
   } catch (err) {
     console.error('analytics csat error', err);
