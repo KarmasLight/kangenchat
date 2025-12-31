@@ -21,7 +21,8 @@ type AgentInfo = { id: string; name?: string | null; displayName?: string | null
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3010';
 const DEFAULT_PRIMARY_COLOR = '#024F9E'; // Enagic water-brand blue
-const socket: Socket = io(BACKEND_URL, { autoConnect: false });
+const SOCKET_URL = BACKEND_URL.replace(/\/api\/?$/, '');
+const socket: Socket = io(SOCKET_URL, { autoConnect: false });
 
 function CustomerWidgetInner() {
   const searchParams = useSearchParams();
