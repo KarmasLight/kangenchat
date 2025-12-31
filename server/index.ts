@@ -683,6 +683,17 @@ const requestHandoffForSession = async (sessionId: string) => {
   if (session.botMode !== 'HUMAN') {
     await prisma.chatSession.update({ where: { id: sessionId }, data: { botMode: 'HUMAN' } });
   }
+
+  const onlineAgentsCount = await prisma.agent.count({ where: { status: 'ONLINE' } });
+  const noAgentsOnline = onlineAgentsCount === 0;
+  if (noAgentsOnline && !alreadyAssigned) {
+    await sendAgentSystemMessage(
+      sessionId,
+      "All live agents are currently offline. Please leave a message and we'll follow up as soon as possible."
+    );
+    return { queuePosition: 0, alreadyAssigned, noAgentsOnline: true as const };
+  }
+
   let queuePosition = 0;
   if (!alreadyAssigned) {
     const waitingSessions = await prisma.chatSession.findMany({
@@ -695,7 +706,7 @@ const requestHandoffForSession = async (sessionId: string) => {
     console.log('[handoff] new_chat_available emitted', { sessionId, queuePosition });
     io.to(agentsRoom).emit('new_chat_available', { sessionId });
   }
-  return { queuePosition, alreadyAssigned };
+  return { queuePosition, alreadyAssigned, noAgentsOnline: false as const };
 };
 
 // POST /sessions: create a pending session (for widget pre-chat)
@@ -1978,30 +1989,32 @@ io.on('connection', (socket) => {
             },
           });
           io.to(sessionRoom(payload.sessionId)).emit('new_message', { ...confirmMsg, sessionId: confirmMsg.chatSessionId });
-          const { queuePosition } = await requestHandoffForSession(payload.sessionId);
-          const queueMsg =
-            typeof queuePosition === 'number'
-              ? queuePosition <= 1
-                ? 'You are next in the queue for a live agent.'
-                : `You are #${queuePosition} in the queue for a live agent.`
-              : 'A live agent will join shortly.';
-          const queueNotice = await prisma.message.create({
-            data: {
-              chatSessionId: payload.sessionId,
-              role: 'AGENT',
-              content: queueMsg,
-            },
-          });
-          io.to(sessionRoom(payload.sessionId)).emit('new_message', { ...queueNotice, sessionId: queueNotice.chatSessionId });
+          const { queuePosition, noAgentsOnline } = await requestHandoffForSession(payload.sessionId);
+          if (!noAgentsOnline) {
+            const queueMsg =
+              typeof queuePosition === 'number'
+                ? queuePosition <= 1
+                  ? 'You are next in the queue for a live agent.'
+                  : `You are #${queuePosition} in the queue for a live agent.`
+                : 'A live agent will join shortly.';
+            const queueNotice = await prisma.message.create({
+              data: {
+                chatSessionId: payload.sessionId,
+                role: 'AGENT',
+                content: queueMsg,
+              },
+            });
+            io.to(sessionRoom(payload.sessionId)).emit('new_message', { ...queueNotice, sessionId: queueNotice.chatSessionId });
+          }
           console.log('[handoff] handoff_status emitted (info complete)', {
             sessionId: payload.sessionId,
             awaitingContactInfo: false,
-            queuePosition,
+            queuePosition: noAgentsOnline ? null : queuePosition,
           });
           io.to(sessionRoom(payload.sessionId)).emit('handoff_status', {
             sessionId: payload.sessionId,
             awaitingContactInfo: false,
-            queuePosition,
+            queuePosition: noAgentsOnline ? null : queuePosition,
           });
           if (typeof callback === 'function') callback({ ok: true });
           return;
@@ -2059,8 +2072,13 @@ io.on('connection', (socket) => {
           select: { id: true, createdAt: true, contactPhone: true, visitor: { select: { email: true, phone: true } } },
         });
 
-        const awaitingContactInfo = !hasContactEmail({ visitor: updated.visitor }) || !hasContactPhone({ contactPhone: updated.contactPhone, visitor: updated.visitor });
+        const awaitingContactInfo =
+          !hasContactEmail({ visitor: updated.visitor }) ||
+          !hasContactPhone({ contactPhone: updated.contactPhone, visitor: updated.visitor });
         console.log('[handoff] request_handoff received', { sessionId: updated.id, awaitingContactInfo });
+
+        const onlineAgentsCount = await prisma.agent.count({ where: { status: 'ONLINE' } });
+        const noAgentsOnline = onlineAgentsCount === 0;
 
         // Determine this session's position in the live-agent queue.
         // Queue consists of OPEN sessions in HUMAN mode with no assigned agent, ordered by createdAt.
@@ -2072,13 +2090,20 @@ io.on('connection', (socket) => {
         const index = waitingSessions.findIndex((s) => s.id === updated.id);
         const queuePosition = index >= 0 ? index + 1 : waitingSessions.length > 0 ? waitingSessions.length : 1;
 
-        io.to(agentsRoom).emit('new_chat_available', { sessionId: updated.id });
+        if (!noAgentsOnline) {
+          io.to(agentsRoom).emit('new_chat_available', { sessionId: updated.id });
+        } else {
+          await sendAgentSystemMessage(
+            updated.id,
+            "All live agents are currently offline. Please leave a message and we'll follow up as soon as possible."
+          );
+        }
         io.to(sessionRoom(updated.id)).emit('handoff_status', {
           sessionId: updated.id,
           awaitingContactInfo,
-          queuePosition,
+          queuePosition: noAgentsOnline ? null : queuePosition,
         });
-        if (typeof callback === 'function') callback({ ok: true, queuePosition });
+        if (typeof callback === 'function') callback({ ok: true, queuePosition: noAgentsOnline ? 0 : queuePosition });
       } catch (err) {
         console.error('request_handoff error', err);
         if (typeof callback === 'function') callback({ error: 'failed' });
