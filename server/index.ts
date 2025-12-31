@@ -1981,6 +1981,27 @@ io.on('connection', (socket) => {
             data: { handoffInfoProvidedAt: new Date() },
           });
           handoffInfoProvidedAt = new Date();
+          const onlineAgentsCount = await prisma.agent.count({ where: { status: 'ONLINE' } });
+          const noAgentsOnline = onlineAgentsCount === 0;
+          if (noAgentsOnline) {
+            await sendAgentSystemMessage(
+              payload.sessionId,
+              "All live agents are currently offline. Please leave a message and we'll follow up as soon as possible."
+            );
+            console.log('[handoff] handoff_status emitted (no agents online)', {
+              sessionId: payload.sessionId,
+              awaitingContactInfo: false,
+              queuePosition: null,
+            });
+            io.to(sessionRoom(payload.sessionId)).emit('handoff_status', {
+              sessionId: payload.sessionId,
+              awaitingContactInfo: false,
+              queuePosition: null,
+            });
+            if (typeof callback === 'function') callback({ ok: true });
+            return;
+          }
+
           const confirmMsg = await prisma.message.create({
             data: {
               chatSessionId: payload.sessionId,
@@ -1989,32 +2010,30 @@ io.on('connection', (socket) => {
             },
           });
           io.to(sessionRoom(payload.sessionId)).emit('new_message', { ...confirmMsg, sessionId: confirmMsg.chatSessionId });
-          const { queuePosition, noAgentsOnline } = await requestHandoffForSession(payload.sessionId);
-          if (!noAgentsOnline) {
-            const queueMsg =
-              typeof queuePosition === 'number'
-                ? queuePosition <= 1
-                  ? 'You are next in the queue for a live agent.'
-                  : `You are #${queuePosition} in the queue for a live agent.`
-                : 'A live agent will join shortly.';
-            const queueNotice = await prisma.message.create({
-              data: {
-                chatSessionId: payload.sessionId,
-                role: 'AGENT',
-                content: queueMsg,
-              },
-            });
-            io.to(sessionRoom(payload.sessionId)).emit('new_message', { ...queueNotice, sessionId: queueNotice.chatSessionId });
-          }
+          const { queuePosition } = await requestHandoffForSession(payload.sessionId);
+          const queueMsg =
+            typeof queuePosition === 'number'
+              ? queuePosition <= 1
+                ? 'You are next in the queue for a live agent.'
+                : `You are #${queuePosition} in the queue for a live agent.`
+              : 'A live agent will join shortly.';
+          const queueNotice = await prisma.message.create({
+            data: {
+              chatSessionId: payload.sessionId,
+              role: 'AGENT',
+              content: queueMsg,
+            },
+          });
+          io.to(sessionRoom(payload.sessionId)).emit('new_message', { ...queueNotice, sessionId: queueNotice.chatSessionId });
           console.log('[handoff] handoff_status emitted (info complete)', {
             sessionId: payload.sessionId,
             awaitingContactInfo: false,
-            queuePosition: noAgentsOnline ? null : queuePosition,
+            queuePosition,
           });
           io.to(sessionRoom(payload.sessionId)).emit('handoff_status', {
             sessionId: payload.sessionId,
             awaitingContactInfo: false,
-            queuePosition: noAgentsOnline ? null : queuePosition,
+            queuePosition,
           });
           if (typeof callback === 'function') callback({ ok: true });
           return;
