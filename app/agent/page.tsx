@@ -2093,6 +2093,26 @@ export default function AgentDashboard() {
     }
     socket.emit('agent_accept', { sessionId }, async (resp: { ok?: boolean; error?: string }) => {
       if (resp?.ok) {
+        const sessionMeta: { createdAt?: string; closedAt?: string; agent?: { id: string; name?: string; displayName?: string; email?: string } } | null =
+          await fetch(`${BACKEND_URL}/sessions/${sessionId}`, {
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+          })
+            .then((r) => (r.ok ? r.json() : null))
+            .catch(() => null);
+        if (sessionMeta?.createdAt) setSelectedSessionCreatedAt(sessionMeta.createdAt);
+        if (sessionMeta?.agent) setSelectedSessionAgent(sessionMeta.agent);
+        if (sessionMeta?.closedAt) {
+          setSelectedSessionClosedAt(sessionMeta.closedAt);
+          setClosedAtMap((prev) => ({ ...prev, [sessionId]: sessionMeta.closedAt as string }));
+        } else {
+          setSelectedSessionClosedAt(undefined);
+          setClosedAtMap((prev) => {
+            if (!prev[sessionId]) return prev;
+            const next = { ...prev };
+            delete next[sessionId];
+            return next;
+          });
+        }
         setSelectedSession(sessionId);
         // clear unread count when opening the chat
         setUnreadCounts((prev) => ({ ...prev, [sessionId]: 0 }));
@@ -2638,15 +2658,15 @@ export default function AgentDashboard() {
                   <Separator className="my-4" />
 
                   <TabsContent value="chats" className="flex-1">
-                    <div className="grid grid-cols-3 gap-5">
-                      <Card className="col-span-1 border border-slate-100/70 bg-linear-to-b from-slate-50 via-white to-slate-100 shadow-lg ring-1 ring-slate-200/60 dark:border-slate-800 dark:bg-linear-to-b dark:from-slate-900/70 dark:via-slate-950/40 dark:to-slate-950/30 dark:ring-slate-800">
+                    <div className="space-y-5">
+                      <Card className="border border-slate-100/70 bg-linear-to-b from-slate-50 via-white to-slate-100 shadow-lg ring-1 ring-slate-200/60 dark:border-slate-800 dark:bg-linear-to-b dark:from-slate-900/70 dark:via-slate-950/40 dark:to-slate-950/30 dark:ring-slate-800">
                         <CardHeader className="rounded-2xl bg-sky-100/70 px-5 py-4">
                           <CardTitle className="text-lg font-semibold leading-tight" style={{ color: PRIMARY_COLOR }}>
                             Available Chats
                           </CardTitle>
                         </CardHeader>
-                        <CardContent className="space-y-4 px-5 pb-5 pt-4">
-                          <div className="mb-4 space-y-3">
+                        <CardContent className="space-y-6 px-5 pb-6 pt-4">
+                          <div className="space-y-4">
                             <div className="flex flex-wrap gap-2">
                               {[
                                 { key: 'waiting', label: `Waiting (${waitingCount})` },
@@ -2663,9 +2683,9 @@ export default function AgentDashboard() {
                                 </Button>
                               ))}
                             </div>
-                            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                              <div className="flex flex-1 flex-col gap-2 sm:flex-row sm:items-center">
-                                <div className="relative flex-1">
+                            <div className="flex flex-col gap-3 xl:flex-row xl:items-center">
+                              <div className="flex flex-1 flex-wrap gap-2">
+                                <div className="relative min-w-[220px] flex-1">
                                   <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                                   <Input
                                     value={chatSearch}
@@ -2679,11 +2699,11 @@ export default function AgentDashboard() {
                                 )}
                               </div>
                               {queueView !== 'closed' && (
-                                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-2">
-                                  <div className="flex items-center gap-2">
+                                <div className="flex flex-1 flex-wrap gap-2">
+                                  <div className="flex flex-1 min-w-[200px] items-center gap-2">
                                     <Filter className="h-4 w-4 text-muted-foreground" />
                                     <Select value={chatFilter} onValueChange={(value: typeof chatFilter) => setChatFilter(value)}>
-                                      <SelectTrigger className="h-9 w-[140px]">
+                                      <SelectTrigger className="h-9 w-full sm:w-[160px]">
                                         <SelectValue placeholder="Filter" />
                                       </SelectTrigger>
                                       <SelectContent>
@@ -2694,10 +2714,10 @@ export default function AgentDashboard() {
                                       </SelectContent>
                                     </Select>
                                   </div>
-                                  <div className="flex items-center gap-2">
+                                  <div className="flex flex-1 min-w-[200px] items-center gap-2">
                                     <Loader2 className="h-4 w-4 text-muted-foreground" />
                                     <Select value={chatSort} onValueChange={(value: typeof chatSort) => setChatSort(value)}>
-                                      <SelectTrigger className="h-9 w-[150px]">
+                                      <SelectTrigger className="h-9 w-full sm:w-[200px]">
                                         <SelectValue placeholder="Sort by" />
                                       </SelectTrigger>
                                       <SelectContent>
@@ -2709,163 +2729,219 @@ export default function AgentDashboard() {
                                 </div>
                               )}
                             </div>
-                            <div className="grid gap-2 text-sm">
-                              <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
-                                <div className="flex items-center gap-2"><Inbox className="h-4 w-4" /><span>{queueView === 'waiting' ? 'Waiting' : queueView === 'active' ? 'Active' : 'Closed'} chats</span></div>
-                                <span className="font-medium text-foreground">{filteredQueueChats.length}</span>
-                              </div>
-                              <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
-                                <div className="flex items-center gap-2"><Users className="h-4 w-4" /><span>Agents online</span></div>
-                                <span className="font-medium text-foreground">{onlineAgents.length}</span>
-                              </div>
-                              <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
-                                <div className="flex items-center gap-2"><Clock className="h-4 w-4" /><span>Longest wait</span></div>
-                                <span className="font-medium text-foreground">{longestWaitSummary}</span>
-                              </div>
-                              <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
-                                <div className="flex items-center gap-2"><Inbox className="h-4 w-4" /><span>Filtered chats</span></div>
-                                <span className="font-medium text-foreground">{filteredQueueCount}</span>
-                              </div>
-                              <div className="flex items-center justify-between rounded-md border border-muted bg-background/80 px-3 py-2 text-muted-foreground shadow-sm">
-                                <div className="flex flex-col">
-                                  <span className="flex items-center gap-2"><Clock className="h-4 w-4" /><span>Slowest waiting</span></span>
-                                  {slowestWaitingChat ? (
-                                    <span className="text-xs text-muted-foreground">{slowestWaitingChat.visitor?.name || slowestWaitingChat.sessionId.slice(-4)} · {slowestWaitingChat.waitMinutes} min</span>
-                                  ) : (
-                                    <span className="text-xs text-muted-foreground">No waiting chats</span>
-                                  )}
+                          </div>
+                          <div className="space-y-6">
+                            <div className="flex gap-3 overflow-x-auto pb-2 text-sm sm:flex-wrap sm:overflow-visible sm:pb-0 [&>*]:min-w-[200px] [&>*]:flex-1">
+                              <div className="rounded-xl border border-muted bg-background/80 px-4 py-3 shadow-sm snap-start">
+                                <div className="flex items-center gap-2 text-muted-foreground">
+                                  <Inbox className="h-4 w-4" />
+                                  <span>{queueView === 'waiting' ? 'Waiting' : queueView === 'active' ? 'Active' : 'Closed'} chats</span>
                                 </div>
-                                <span className="text-sm font-semibold text-foreground">
-                                  {slowestWaitingChat ? `${slowestWaitingChat.waitMinutes} min` : '—'}
-                                </span>
+                                <div className="mt-1 text-2xl font-semibold text-foreground">{filteredQueueChats.length}</div>
+                                <p className="text-xs text-muted-foreground">Currently visible in this tab</p>
                               </div>
-                            </div>
-                          </div>
-                          <ScrollArea className="h-[60vh] rounded-2xl border border-slate-200/70 bg-linear-to-b from-white via-slate-50 to-slate-100 p-3 shadow-inner dark:border-slate-800 dark:bg-linear-to-b dark:from-slate-950/60 dark:via-slate-900/50 dark:to-slate-900/40">
-                            <ul>
-                    {queueView !== 'closed' && filteredQueueChats.map((chat) => {
-                      const waitMinutes = computeWaitMinutes(chat.createdAt);
-                      const waitLabel = waitMinutes === null
-                        ? 'Waiting'
-                        : waitMinutes < 1
-                        ? 'Waiting <1 min'
-                        : `Waiting ${waitMinutes} min`;
-                      const urgencyClass = waitMinutes === null
-                        ? 'hover:border-slate-300'
-                        : waitMinutes >= 15
-                        ? 'border-red-200 bg-red-50/60 hover:border-red-300 dark:border-red-900/40 dark:bg-red-900/20'
-                        : waitMinutes >= 5
-                        ? 'border-amber-200 bg-amber-50/60 hover:border-amber-300 dark:border-amber-900/40 dark:bg-amber-900/20'
-                        : 'border-emerald-200 bg-emerald-50/60 hover:border-emerald-300 dark:border-emerald-900/40 dark:bg-emerald-900/10';
-                      return (
-                        <li key={chat.sessionId} className="mb-2">
-                          <Button
-                            variant={selectedSession === chat.sessionId ? 'default' : 'outline'}
-                            className={`relative w-full justify-between text-left h-auto py-3 px-3 transition ${
-                              selectedSession === chat.sessionId
-                                ? 'ring-2 ring-blue-200'
-                                : newChats[chat.sessionId]
-                                ? 'ring-2 ring-blue-500 border-blue-500 bg-blue-100 dark:bg-blue-900/40'
-                                : urgencyClass
-                            }`}
-                            aria-pressed={selectedSession === chat.sessionId}
-                            onClick={() => acceptChat(chat.sessionId)}
-                            disabled={queueView === 'waiting' ? (!token || !!assignedAgents[chat.sessionId]) : false}
-                          >
-                            <div className="flex flex-col items-start gap-1">
-                              <span className="text-sm font-medium text-foreground">{chat.visitor?.name || chat.visitor?.email || chat.issueType || `Session ${chat.sessionId.slice(-4)}`}</span>
-                              {chat.visitor?.email && (
-                                <span className="text-xs text-muted-foreground">{chat.visitor.email}</span>
-                              )}
-                              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                                {chat.issueType && (
-                                  <span className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2 py-0.5 dark:bg-gray-800">
-                                    {chat.issueType}
+                              <div className="rounded-xl border border-muted bg-background/80 px-4 py-3 shadow-sm snap-start">
+                                <div className="flex items-center gap-2 text-muted-foreground">
+                                  <Users className="h-4 w-4" />
+                                  <span>Agents online</span>
+                                </div>
+                                <div className="mt-1 text-2xl font-semibold text-foreground">{onlineAgents.length}</div>
+                                <p className="text-xs text-muted-foreground">Ready to take chats</p>
+                              </div>
+                              <div className="rounded-xl border border-muted bg-background/80 px-4 py-3 shadow-sm snap-start">
+                                <div className="flex items-center gap-2 text-muted-foreground">
+                                  <Clock className="h-4 w-4" />
+                                  <span>Longest wait</span>
+                                </div>
+                                <div className="mt-1 text-2xl font-semibold text-foreground">{longestWaitSummary}</div>
+                                <p className="text-xs text-muted-foreground">Updates every minute</p>
+                              </div>
+                              <div className="rounded-xl border border-muted bg-background/80 px-4 py-3 shadow-sm snap-start">
+                                <div className="flex items-center gap-2 text-muted-foreground">
+                                  <Inbox className="h-4 w-4" />
+                                  <span>Filtered chats</span>
+                                </div>
+                                <div className="mt-1 text-2xl font-semibold text-foreground">{filteredQueueCount}</div>
+                                <p className="text-xs text-muted-foreground">After search & filters</p>
+                              </div>
+                              <div className="rounded-xl border border-muted bg-background/80 px-4 py-3 shadow-sm snap-start">
+                                <div className="flex items-center gap-2 text-muted-foreground">
+                                  <Clock className="h-4 w-4" />
+                                  <span>Slowest waiting</span>
+                                </div>
+                                <div className="mt-1 flex items-center justify-between text-sm text-foreground">
+                                  <div>
+                                    {slowestWaitingChat ? (
+                                      <>
+                                        <div className="font-medium">
+                                          {slowestWaitingChat.visitor?.name || slowestWaitingChat.sessionId.slice(-4)}
+                                        </div>
+                                        <div className="text-xs text-muted-foreground">{slowestWaitingChat.waitMinutes} min in queue</div>
+                                      </>
+                                    ) : (
+                                      <div className="text-xs text-muted-foreground">No waiting chats</div>
+                                    )}
+                                  </div>
+                                  <span className="text-lg font-semibold">
+                                    {slowestWaitingChat ? `${slowestWaitingChat.waitMinutes} min` : '—'}
                                   </span>
-                                )}
-                                <span className="inline-flex items-center gap-1">
-                                  <Clock className="h-3 w-3" />
-                                  {waitLabel}
-                                </span>
+                                </div>
                               </div>
                             </div>
-                            <div className="flex items-center gap-2">
-                              {endedChats[chat.sessionId] ? (
-                                <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200">
-                                  Ended
+                            <div className="rounded-3xl border border-slate-200/70 bg-linear-to-b from-white via-slate-50 to-slate-100 p-4 shadow-inner dark:border-slate-800 dark:bg-linear-to-b dark:from-slate-950/60 dark:via-slate-900/50 dark:to-slate-900/40">
+                              <div className="flex items-center justify-between">
+                                <div>
+                                  <p className="text-base font-semibold text-foreground">Live Queue</p>
+                                  <p className="text-xs text-muted-foreground">
+                                    {queueView === 'closed'
+                                      ? 'Browse transcripts from recently ended chats'
+                                      : 'Select a chat to preview, accept, or transfer'}
+                                  </p>
+                                </div>
+                                <span className="text-xs rounded-full bg-slate-200/70 px-2 py-0.5 text-slate-700 dark:bg-slate-800 dark:text-slate-200">
+                                  {queueView === 'closed' ? 'Closed' : queueView === 'active' ? 'Active' : 'Waiting'} view
                                 </span>
-                              ) : assignedAgents[chat.sessionId] && assignedAgents[chat.sessionId].id !== selfAgentId ? (
-                                <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
-                                  Assigned: {assignedAgents[chat.sessionId].displayName || assignedAgents[chat.sessionId].name || assignedAgents[chat.sessionId].email}
-                                </span>
-                              ) : selectedSession === chat.sessionId ? (
-                                <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300">
-                                  <span className="h-2 w-2 rounded-full bg-green-500" />
-                                  Active
-                                </span>
-                              ) : (
-                                <span className="flex items-center gap-2">
-                                  {newChats[chat.sessionId] && (
-                                    <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-blue-600 text-white dark:bg-blue-500 dark:text-white">
-                                      New
-                                    </span>
-                                  )}
-                                  {(unreadCounts[chat.sessionId] ?? 0) > 0 && (
-                                    <span className="inline-flex items-center justify-center text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300 min-w-6">
-                                      {unreadCounts[chat.sessionId]}
-                                    </span>
-                                  )}
-                                </span>
-                              )}
+                              </div>
+                              <ScrollArea className="mt-3 h-[40vh] rounded-2xl border border-slate-100/70 bg-white/80 p-3 shadow-inner dark:border-slate-800 dark:bg-slate-950/30">
+                                <ul>
+                                  {queueView !== 'closed'
+                                    ? filteredQueueChats.map((chat) => {
+                                        const waitMinutes = computeWaitMinutes(chat.createdAt);
+                                        const waitLabel =
+                                          waitMinutes === null
+                                            ? 'Waiting'
+                                            : waitMinutes < 1
+                                            ? 'Waiting <1 min'
+                                            : `Waiting ${waitMinutes} min`;
+                                        const urgencyClass =
+                                          waitMinutes === null
+                                            ? 'hover:border-slate-300'
+                                            : waitMinutes >= 15
+                                            ? 'border-red-200 bg-red-50/60 hover:border-red-300 dark:border-red-900/40 dark:bg-red-900/20'
+                                            : waitMinutes >= 5
+                                            ? 'border-amber-200 bg-amber-50/60 hover:border-amber-300 dark:border-amber-900/40 dark:bg-amber-900/20'
+                                            : 'border-emerald-200 bg-emerald-50/60 hover:border-emerald-300 dark:border-emerald-900/40 dark:bg-emerald-900/10';
+                                        return (
+                                          <li key={chat.sessionId} className="mb-2">
+                                            <Button
+                                              variant={selectedSession === chat.sessionId ? 'default' : 'outline'}
+                                              className={`relative w-full justify-between text-left h-auto py-3 px-3 transition ${
+                                                selectedSession === chat.sessionId
+                                                  ? 'ring-2 ring-blue-200'
+                                                  : newChats[chat.sessionId]
+                                                  ? 'ring-2 ring-blue-500 border-blue-500 bg-blue-100 dark:bg-blue-900/40'
+                                                  : urgencyClass
+                                              }`}
+                                              aria-pressed={selectedSession === chat.sessionId}
+                                              onClick={() => acceptChat(chat.sessionId)}
+                                              disabled={queueView === 'waiting' ? (!token || !!assignedAgents[chat.sessionId]) : false}
+                                            >
+                                              <div className="flex flex-col items-start gap-1">
+                                                <span className="text-sm font-medium text-foreground">
+                                                  {chat.visitor?.name || chat.visitor?.email || chat.issueType || `Session ${chat.sessionId.slice(-4)}`}
+                                                </span>
+                                                {chat.visitor?.email && (
+                                                  <span className="text-xs text-muted-foreground">{chat.visitor.email}</span>
+                                                )}
+                                                <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                                                  {chat.issueType && (
+                                                    <span className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2 py-0.5 dark:bg-gray-800">
+                                                      {chat.issueType}
+                                                    </span>
+                                                  )}
+                                                  <span className="inline-flex items-center gap-1">
+                                                    <Clock className="h-3 w-3" />
+                                                    {waitLabel}
+                                                  </span>
+                                                </div>
+                                              </div>
+                                              <div className="flex items-center gap-2">
+                                                {endedChats[chat.sessionId] ? (
+                                                  <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200">
+                                                    Ended
+                                                  </span>
+                                                ) : assignedAgents[chat.sessionId] && assignedAgents[chat.sessionId].id !== selfAgentId ? (
+                                                  <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
+                                                    Assigned: {assignedAgents[chat.sessionId].displayName || assignedAgents[chat.sessionId].name || assignedAgents[chat.sessionId].email}
+                                                  </span>
+                                                ) : selectedSession === chat.sessionId ? (
+                                                  <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300">
+                                                    <span className="h-2 w-2 rounded-full bg-green-500" />
+                                                    Active
+                                                  </span>
+                                                ) : (
+                                                  <span className="flex items-center gap-2">
+                                                    {newChats[chat.sessionId] && (
+                                                      <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-blue-600 text-white dark:bg-blue-500 dark:text-white">
+                                                        New
+                                                      </span>
+                                                    )}
+                                                    {(unreadCounts[chat.sessionId] ?? 0) > 0 && (
+                                                      <span className="inline-flex items-center justify-center text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300 min-w-6">
+                                                        {unreadCounts[chat.sessionId]}
+                                                      </span>
+                                                    )}
+                                                  </span>
+                                                )}
+                                              </div>
+                                              {rowToasts[chat.sessionId] && (
+                                                <span className="absolute -top-2 right-2 inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-black/80 text-white shadow">
+                                                  {rowToasts[chat.sessionId]}
+                                                </span>
+                                              )}
+                                            </Button>
+                                          </li>
+                                        );
+                                      })
+                                    : filteredQueueChats.map((chat) => (
+                                        <li key={chat.sessionId} className="mb-2">
+                                          <Button
+                                            variant="outline"
+                                            className="w-full justify-between text-left h-auto py-2 px-3 opacity-90"
+                                            onClick={() => openClosedChat(chat.sessionId)}
+                                          >
+                                            <div className="flex flex-col items-start">
+                                              {chat.visitor && (
+                                                <span className="text-sm text-muted-foreground">
+                                                  {chat.visitor.name || 'Anonymous'}
+                                                  {chat.visitor.email && ` <${chat.visitor.email}>`}
+                                                </span>
+                                              )}
+                                              {chat.issueType && (
+                                                <span className="text-xs bg-gray-100 dark:bg-gray-800 px-2 py-0.5 rounded mt-1">{chat.issueType}</span>
+                                              )}
+                                              {chat.createdAt && closedAtMap[chat.sessionId] && (
+                                                <span className="text-xs text-muted-foreground mt-1">
+                                                  {(() => {
+                                                    const secs = Math.max(
+                                                      0,
+                                                      Math.floor(
+                                                        (new Date(closedAtMap[chat.sessionId] as string).getTime() -
+                                                          new Date(chat.createdAt as string).getTime()) /
+                                                          1000
+                                                      )
+                                                    );
+                                                    const mm = String(Math.floor(secs / 60)).padStart(2, '0');
+                                                    const ss = String(secs % 60).padStart(2, '0');
+                                                    return `Total: ${mm}:${ss}`;
+                                                  })()}
+                                                </span>
+                                              )}
+                                            </div>
+                                            <span className="ml-3 inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200">
+                                              Ended
+                                            </span>
+                                          </Button>
+                                        </li>
+                                      ))}
+                                </ul>
+                              </ScrollArea>
                             </div>
-                            {rowToasts[chat.sessionId] && (
-                              <span className="absolute -top-2 right-2 inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-black/80 text-white shadow">
-                                {rowToasts[chat.sessionId]}
-                              </span>
-                            )}
-                          </Button>
-                        </li>
-                      );
-                    })}
-                    {queueView === 'closed' && filteredQueueChats.map(chat => (
-                      <li key={chat.sessionId} className="mb-2">
-                        <Button
-                          variant="outline"
-                          className="w-full justify-between text-left h-auto py-2 px-3 opacity-90"
-                          onClick={() => openClosedChat(chat.sessionId)}
-                        >
-                          <div className="flex flex-col items-start">
-                            {chat.visitor && (
-                              <span className="text-sm text-muted-foreground">
-                                {chat.visitor.name || 'Anonymous'}{chat.visitor.email && ` <${chat.visitor.email}>`}
-                              </span>
-                            )}
-                            {chat.issueType && (
-                              <span className="text-xs bg-gray-100 dark:bg-gray-800 px-2 py-0.5 rounded mt-1">{chat.issueType}</span>
-                            )}
-                            {chat.createdAt && closedAtMap[chat.sessionId] && (
-                              <span className="text-xs text-muted-foreground mt-1">
-                                {(() => {
-                                  const secs = Math.max(0, Math.floor((new Date(closedAtMap[chat.sessionId] as string).getTime() - new Date(chat.createdAt as string).getTime()) / 1000));
-                                  const mm = String(Math.floor(secs / 60)).padStart(2, '0');
-                                  const ss = String(secs % 60).padStart(2, '0');
-                                  return `Total: ${mm}:${ss}`;
-                                })()}
-                              </span>
-                            )}
                           </div>
-                          <span className="ml-3 inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200">
-                            Ended
-                          </span>
-                        </Button>
-                      </li>
-                    ))}
-                  </ul>
-                </ScrollArea>
-              </CardContent>
-            </Card>
+                        </CardContent>
+                      </Card>
 
-            <Card className="col-span-2 flex flex-col overflow-hidden border border-indigo-100/70 bg-linear-to-b from-white via-indigo-50/80 to-white/90 shadow-xl ring-1 ring-indigo-100/70 dark:border-slate-800 dark:bg-linear-to-b dark:from-slate-950/70 dark:via-slate-900/60 dark:to-slate-900/40 dark:ring-slate-900/60">
+                      <Card className="flex flex-col overflow-hidden border border-indigo-100/70 bg-linear-to-b from-white via-indigo-50/80 to-white/90 shadow-xl ring-1 ring-indigo-100/70 dark:border-slate-800 dark:bg-linear-to-b dark:from-slate-950/70 dark:via-slate-900/60 dark:to-slate-900/40 dark:ring-slate-900/60">
               <CardHeader className="rounded-2xl bg-indigo-100/70 px-5 py-4">
                 <CardTitle className="flex items-center justify-between">
                   <span className="flex items-center gap-3">

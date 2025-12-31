@@ -1706,26 +1706,53 @@ io.on('connection', (socket) => {
             return;
           }
         }
+        const chatSessionBaseSelect = {
+          id: true,
+          botConversationId: true,
+          botMode: true,
+          visitorId: true,
+          contactPhone: true,
+          distributorId: true,
+          handoffInfoRequestedAt: true,
+          handoffInfoProvidedAt: true,
+          initialEmailRequestedAt: true,
+          initialPhoneRequestedAt: true,
+          visitor: { select: { id: true, name: true, email: true, phone: true } },
+        } as const satisfies Prisma.ChatSessionSelect;
         const chatSession = await prisma.chatSession.findUnique({
           where: { id: payload.sessionId },
-          select: {
-            id: true,
-            botConversationId: true,
-            botMode: true,
-            visitorId: true,
-            contactPhone: true,
-            distributorId: true,
-            handoffInfoRequestedAt: true,
-            handoffInfoProvidedAt: true,
-            initialEmailRequestedAt: true,
-            initialPhoneRequestedAt: true,
-            visitor: { select: { id: true, name: true, email: true, phone: true } },
-          },
+          select: chatSessionBaseSelect,
         });
         if (!chatSession) {
           if (typeof callback === 'function') callback({ error: 'Session not found' });
           return;
         }
+        type ChatSessionState = Prisma.ChatSessionGetPayload<{ select: typeof chatSessionBaseSelect }>;
+        const sessionSnapshot: ChatSessionState = chatSession;
+        type VisitorState = {
+          id: string;
+          name: string | null;
+          email: string | null;
+          phone: string | null;
+        };
+        const toVisitorState = (visitor: ChatSessionState['visitor']) =>
+          visitor ? { id: visitor.id, name: visitor.name, email: visitor.email, phone: visitor.phone ?? null } : null;
+        let visitorState: VisitorState | null =
+          toVisitorState(sessionSnapshot.visitor) ??
+          (sessionSnapshot.visitorId ? { id: sessionSnapshot.visitorId, name: null, email: null, phone: null } : null);
+        let contactPhoneState: string | null = sessionSnapshot.contactPhone ?? null;
+        let distributorIdState: string | null = sessionSnapshot.distributorId ?? null;
+        let handoffInfoRequestedAt: Date | null = sessionSnapshot.handoffInfoRequestedAt ?? null;
+        let handoffInfoProvidedAt: Date | null = sessionSnapshot.handoffInfoProvidedAt ?? null;
+        let botModeState: string | null = sessionSnapshot.botMode ?? null;
+        let initialEmailRequestedAt: Date | null = sessionSnapshot.initialEmailRequestedAt ?? null;
+        let initialPhoneRequestedAt: Date | null = sessionSnapshot.initialPhoneRequestedAt ?? null;
+        type ContactState = { contactPhone?: string | null; visitor?: { email?: string | null; phone?: string | null } | null };
+        const contactState = (): ContactState => ({
+          contactPhone: contactPhoneState,
+          visitor: visitorState ? { email: visitorState.email, phone: visitorState.phone } : null,
+        });
+
         const msg = await prisma.message.create({
           data: {
             chatSessionId: payload.sessionId,
@@ -1740,7 +1767,7 @@ io.on('connection', (socket) => {
         });
         let parsedName: { first: string; fullName: string } | null = null;
         const isQuickReply = payload.role === 'USER' ? isQuickReplyMessage(payload.content) : false;
-        const missingName = payload.role === 'USER' && chatSession.visitorId && !chatSession.visitor?.name;
+        const missingName = payload.role === 'USER' && visitorState && !visitorState.name;
         if (missingName) {
           const visitorId = chatSession.visitorId;
           if (!visitorId) {
@@ -1776,10 +1803,11 @@ io.on('connection', (socket) => {
               ...greetingMsg,
               sessionId: greetingMsg.chatSessionId,
             });
-            chatSession.visitor = {
-              ...(chatSession.visitor ?? { id: visitorId, email: null, phone: null }),
-              name: parsedName.fullName,
-            };
+            if (visitorState) {
+              visitorState = { ...visitorState, name: parsedName.fullName };
+            } else if (visitorId) {
+              visitorState = { id: visitorId, name: parsedName.fullName, email: null, phone: null };
+            }
           } else {
             const reminderMsg = await prisma.message.create({
               data: {
@@ -1797,18 +1825,20 @@ io.on('connection', (socket) => {
           }
         }
         const shouldSkipBotForward = Boolean(parsedName);
-        const sessionHasName = requiresName(chatSession) === false;
+        const sessionHasName = Boolean(visitorState?.name);
         const needsHandoffInfo = sessionHasName && shouldAutoRequestHandoff(payload.content);
         console.debug('[send_message] parsedName:', parsedName, 'sessionHasName:', sessionHasName, 'needsHandoffInfo:', needsHandoffInfo, 'content:', payload.content);
         if (needsHandoffInfo) {
-          const alreadyRequestedInfo = Boolean(chatSession.handoffInfoRequestedAt);
+          const alreadyRequestedInfo = Boolean(handoffInfoRequestedAt);
           if (!alreadyRequestedInfo) {
             await prisma.chatSession.update({
               where: { id: payload.sessionId },
               data: { handoffInfoRequestedAt: new Date(), botMode: 'HUMAN' },
             });
+            handoffInfoRequestedAt = new Date();
+            botModeState = 'HUMAN';
             const emailPromptAt = await promptForContactEmail(payload.sessionId);
-            chatSession.initialEmailRequestedAt = emailPromptAt;
+            initialEmailRequestedAt = emailPromptAt;
             await sendAgentSystemMessage(
               payload.sessionId,
               'Once I have your email, I’ll grab the best phone number to reach you (and distributor ID if you have one).'
@@ -1823,35 +1853,37 @@ io.on('connection', (socket) => {
         }
 
         // After name is captured, collect email (first) and then phone before allowing handoff
-        if (sessionHasName && chatSession.visitorId) {
+        if (sessionHasName && sessionSnapshot.visitorId) {
           const emailMatch = extractEmailFromMessage(payload.content);
-          if (emailMatch && needsEmail(chatSession)) {
+          if (emailMatch && needsEmail({ visitor: visitorState })) {
             await prisma.visitor.update({
-              where: { id: chatSession.visitorId },
+              where: { id: sessionSnapshot.visitorId },
               data: { email: emailMatch },
             });
-            chatSession.visitor = { ...(chatSession.visitor ?? { id: chatSession.visitorId, name: null, phone: null }), email: emailMatch };
+            visitorState = visitorState
+              ? { ...visitorState, email: emailMatch }
+              : { id: sessionSnapshot.visitorId, name: null, email: emailMatch, phone: null };
             await sendAgentSystemMessage(payload.sessionId, 'Thanks! I’ve got your email.');
-            if (needsPhone(chatSession) && !chatSession.initialPhoneRequestedAt) {
+            if (needsPhone(contactState()) && !initialPhoneRequestedAt) {
               const phonePromptAt = await promptForContactPhone(payload.sessionId);
-              chatSession.initialPhoneRequestedAt = phonePromptAt;
+              initialPhoneRequestedAt = phonePromptAt;
             }
-          } else if (!emailMatch && needsEmail(chatSession) && looksLikeEmailInput(payload.content)) {
+          } else if (!emailMatch && needsEmail({ visitor: visitorState }) && looksLikeEmailInput(payload.content)) {
             await sendAgentSystemMessage(
               payload.sessionId,
               'I couldn’t validate that email. Mind double-checking the spelling so I can pass it to the live agent?'
             );
           }
-          const emailReady = !needsEmail(chatSession);
+          const emailReady = !needsEmail({ visitor: visitorState });
           const phoneMatch = extractPhoneFromMessage(payload.content);
-          if (emailReady && phoneMatch && needsPhone(chatSession)) {
+          if (emailReady && phoneMatch && needsPhone(contactState())) {
             await prisma.chatSession.update({
               where: { id: payload.sessionId },
               data: { contactPhone: phoneMatch },
             });
-            chatSession.contactPhone = phoneMatch;
+            contactPhoneState = phoneMatch;
             await sendAgentSystemMessage(payload.sessionId, 'Got it—thanks for the phone number.');
-          } else if (!emailReady && phoneMatch && needsPhone(chatSession)) {
+          } else if (!emailReady && phoneMatch && needsPhone(contactState())) {
             await sendAgentSystemMessage(
               payload.sessionId,
               'Appreciate that! I just need your email first, then I’ll grab the phone number.'
@@ -1859,36 +1891,36 @@ io.on('connection', (socket) => {
           }
           // If user asked for handoff and we still need email/phone, prompt for them
           if (needsHandoffInfo) {
-            if (needsEmail(chatSession)) {
+            if (needsEmail({ visitor: visitorState })) {
               const emailReminderAt = await remindEmailNeeded(
                 payload.sessionId,
-                Boolean(chatSession.initialEmailRequestedAt)
+                Boolean(initialEmailRequestedAt)
               );
-              if (emailReminderAt) chatSession.initialEmailRequestedAt = emailReminderAt;
-            } else if (needsPhone(chatSession)) {
+              if (emailReminderAt) initialEmailRequestedAt = emailReminderAt;
+            } else if (needsPhone(contactState())) {
               const phoneReminderAt = await remindPhoneNeeded(
                 payload.sessionId,
-                Boolean(chatSession.initialPhoneRequestedAt)
+                Boolean(initialPhoneRequestedAt)
               );
-              if (phoneReminderAt) chatSession.initialPhoneRequestedAt = phoneReminderAt;
+              if (phoneReminderAt) initialPhoneRequestedAt = phoneReminderAt;
             }
             if (typeof callback === 'function') callback({ ok: true });
             return;
           }
         }
 
-        if (chatSession.handoffInfoRequestedAt && !chatSession.handoffInfoProvidedAt && chatSession.botMode === 'HUMAN') {
+        if (handoffInfoRequestedAt && !handoffInfoProvidedAt && botModeState === 'HUMAN') {
           const extractedPhone = extractPhoneFromMessage(payload.content);
           const distributorMatch = payload.content.match(/\b\d{4,}\b/);
-          const alreadyHasValidPhone = hasContactPhone(chatSession);
+          const alreadyHasValidPhone = hasContactPhone(contactState());
           const phoneNowValid = alreadyHasValidPhone || Boolean(extractedPhone);
 
-          if (needsEmail(chatSession)) {
+          if (needsEmail({ visitor: visitorState })) {
             const emailReminderAt = await remindEmailNeeded(
               payload.sessionId,
-              Boolean(chatSession.initialEmailRequestedAt)
+              Boolean(initialEmailRequestedAt)
             );
-            if (emailReminderAt) chatSession.initialEmailRequestedAt = emailReminderAt;
+            if (emailReminderAt) initialEmailRequestedAt = emailReminderAt;
             if (typeof callback === 'function') callback({ ok: true });
             return;
           }
@@ -1898,7 +1930,7 @@ io.on('connection', (socket) => {
               where: { id: payload.sessionId },
               data: { contactPhone: extractedPhone },
             });
-            chatSession.contactPhone = extractedPhone;
+            contactPhoneState = extractedPhone;
           }
 
           if (!phoneNowValid) {
@@ -1910,9 +1942,9 @@ io.on('connection', (socket) => {
             } else {
               const phoneReminderAt = await remindPhoneNeeded(
                 payload.sessionId,
-                Boolean(chatSession.initialPhoneRequestedAt)
+                Boolean(initialPhoneRequestedAt)
               );
-              if (phoneReminderAt) chatSession.initialPhoneRequestedAt = phoneReminderAt;
+              if (phoneReminderAt) initialPhoneRequestedAt = phoneReminderAt;
             }
             if (typeof callback === 'function') callback({ ok: true });
             return;
@@ -1923,13 +1955,14 @@ io.on('connection', (socket) => {
               where: { id: payload.sessionId },
               data: { distributorId: distributorMatch[0] },
             });
-            chatSession.distributorId = distributorMatch[0];
+            distributorIdState = distributorMatch[0];
           }
 
           await prisma.chatSession.update({
             where: { id: payload.sessionId },
             data: { handoffInfoProvidedAt: new Date() },
           });
+          handoffInfoProvidedAt = new Date();
           const confirmMsg = await prisma.message.create({
             data: {
               chatSessionId: payload.sessionId,
