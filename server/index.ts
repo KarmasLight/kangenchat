@@ -1726,8 +1726,12 @@ io.on('connection', (socket) => {
         }
         const chatSessionBaseSelect = {
           id: true,
+          status: true,
+          closedReason: true,
+          closedAt: true,
           botConversationId: true,
           botMode: true,
+          agentId: true,
           visitorId: true,
           contactPhone: true,
           distributorId: true,
@@ -1743,6 +1747,11 @@ io.on('connection', (socket) => {
         });
         if (!chatSession) {
           if (typeof callback === 'function') callback({ error: 'Session not found' });
+          return;
+        }
+
+        if (chatSession.status !== 'OPEN') {
+          if (typeof callback === 'function') callback({ error: 'Session is closed' });
           return;
         }
         type ChatSessionState = Prisma.ChatSessionGetPayload<{ select: typeof chatSessionBaseSelect }>;
@@ -1783,6 +1792,42 @@ io.on('connection', (socket) => {
           ...msg,
           sessionId: msg.chatSessionId,
         });
+
+        // Offline fallback: if no agents online and visitor has completed handoff info,
+        // accept exactly one follow-up message then close the chat as an offline submission.
+        if (
+          payload.role === 'USER' &&
+          !chatSession.agentId &&
+          chatSession.botMode === 'HUMAN' &&
+          Boolean(chatSession.handoffInfoProvidedAt) &&
+          !chatSession.closedReason
+        ) {
+          const onlineAgentsCount = await prisma.agent.count({ where: { status: 'ONLINE' } });
+          if (onlineAgentsCount === 0) {
+            const ack = await prisma.message.create({
+              data: {
+                chatSessionId: payload.sessionId,
+                role: 'AGENT',
+                content: "Thanks — your message has been sent. We'll follow up as soon as a live agent is available.",
+              },
+            });
+            io.to(sessionRoom(payload.sessionId)).emit('new_message', { ...ack, sessionId: ack.chatSessionId });
+
+            await prisma.chatSession.update({
+              where: { id: payload.sessionId },
+              data: {
+                status: 'CLOSED',
+                closedReason: 'OFFLINE_MESSAGE',
+                closedAt: new Date(),
+              },
+            });
+
+            io.to(sessionRoom(payload.sessionId)).emit('chat_closed', { sessionId: payload.sessionId });
+            io.to(agentsRoom).emit('offline_message_created', { sessionId: payload.sessionId });
+            if (typeof callback === 'function') callback({ ok: true });
+            return;
+          }
+        }
         let parsedName: { first: string; fullName: string } | null = null;
         const isQuickReply = payload.role === 'USER' ? isQuickReplyMessage(payload.content) : false;
         const missingName = payload.role === 'USER' && visitorState && !visitorState.name;
