@@ -1594,6 +1594,12 @@ io.on('connection', (socket) => {
   // Agent updates presence: join/leave agents room accordingly
   socket.on('presence_update', (payload: { status: 'ONLINE' | 'OFFLINE' }) => {
     try {
+      const agentIdForSocket = socket.data.agentId as string | undefined;
+      if (agentIdForSocket && (payload.status === 'ONLINE' || payload.status === 'OFFLINE')) {
+        prisma.agent
+          .update({ where: { id: agentIdForSocket }, data: { status: payload.status } })
+          .catch((err) => console.error('presence_update status update error', err));
+      }
       if (payload.status === 'ONLINE') {
         socket.join(agentsRoom);
       } else {
@@ -2187,6 +2193,7 @@ app.post('/presence', authMiddleware, async (req: any, res) => {
   const { status } = req.body as { status: 'ONLINE' | 'OFFLINE' };
   if (status !== 'ONLINE' && status !== 'OFFLINE') return res.status(400).json({ error: 'Invalid status' });
   const updated = await prisma.agent.update({ where: { id: req.agentId }, data: { status } });
+  await emitAgentsDirectory();
   res.json({ ok: true, status: updated.status });
 });
 
