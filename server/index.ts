@@ -692,6 +692,7 @@ const requestHandoffForSession = async (sessionId: string) => {
     });
     const index = waitingSessions.findIndex((s) => s.id === sessionId);
     queuePosition = index >= 0 ? index + 1 : waitingSessions.length > 0 ? waitingSessions.length : 1;
+    console.log('[handoff] new_chat_available emitted', { sessionId, queuePosition });
     io.to(agentsRoom).emit('new_chat_available', { sessionId });
   }
   return { queuePosition, alreadyAssigned };
@@ -1986,6 +1987,11 @@ io.on('connection', (socket) => {
             },
           });
           io.to(sessionRoom(payload.sessionId)).emit('new_message', { ...queueNotice, sessionId: queueNotice.chatSessionId });
+          console.log('[handoff] handoff_status emitted (info complete)', {
+            sessionId: payload.sessionId,
+            awaitingContactInfo: false,
+            queuePosition,
+          });
           io.to(sessionRoom(payload.sessionId)).emit('handoff_status', {
             sessionId: payload.sessionId,
             awaitingContactInfo: false,
@@ -2044,8 +2050,11 @@ io.on('connection', (socket) => {
         const updated = await prisma.chatSession.update({
           where: { id: payload.sessionId },
           data: { botMode: 'HUMAN' },
-          select: { id: true, createdAt: true },
+          select: { id: true, createdAt: true, contactPhone: true, visitor: { select: { email: true, phone: true } } },
         });
+
+        const awaitingContactInfo = !hasContactEmail({ visitor: updated.visitor }) || !hasContactPhone({ contactPhone: updated.contactPhone, visitor: updated.visitor });
+        console.log('[handoff] request_handoff received', { sessionId: updated.id, awaitingContactInfo });
 
         // Determine this session's position in the live-agent queue.
         // Queue consists of OPEN sessions in HUMAN mode with no assigned agent, ordered by createdAt.
@@ -2058,6 +2067,11 @@ io.on('connection', (socket) => {
         const queuePosition = index >= 0 ? index + 1 : waitingSessions.length > 0 ? waitingSessions.length : 1;
 
         io.to(agentsRoom).emit('new_chat_available', { sessionId: updated.id });
+        io.to(sessionRoom(updated.id)).emit('handoff_status', {
+          sessionId: updated.id,
+          awaitingContactInfo,
+          queuePosition,
+        });
         if (typeof callback === 'function') callback({ ok: true, queuePosition });
       } catch (err) {
         console.error('request_handoff error', err);
