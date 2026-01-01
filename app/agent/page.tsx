@@ -3466,7 +3466,13 @@ export default function AgentDashboard() {
               </CardHeader>
               <CardContent className="space-y-5">
                 <div className="rounded-2xl border border-dashed border-purple-200/80 bg-white/70 p-4 shadow-sm dark:border-purple-900/40 dark:bg-slate-950/40">
-                  <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+                  <form
+                    className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      createAgent();
+                    }}
+                  >
                     <div className="flex-1 grid gap-3 sm:grid-cols-2">
                       <div className="space-y-1.5">
                         <Label htmlFor="new-agent-name">Full name</Label>
@@ -3540,11 +3546,12 @@ export default function AgentDashboard() {
                       </div>
                     </div>
                     <div className="flex w-full flex-col gap-2 md:w-48">
-                      <Button onClick={createAgent} disabled={newAgentBusy}>
+                      <Button type="submit" disabled={newAgentBusy}>
                         {newAgentBusy ? 'Creating…' : 'Create agent'}
                       </Button>
                       <Button
                         variant="ghost"
+                        type="button"
                         onClick={() => {
                           setNewAgentName('');
                           setNewAgentDisplayName('');
@@ -3561,7 +3568,7 @@ export default function AgentDashboard() {
                         New agents receive no automated email yet—share the temporary password manually.
                       </p>
                     </div>
-                  </div>
+                  </form>
                 </div>
                 {agents.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 p-4 text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900/40 dark:text-slate-300">
@@ -3607,7 +3614,13 @@ export default function AgentDashboard() {
                               </SelectContent>
                             </Select>
                           </div>
-                          <div className="flex flex-col gap-2">
+                          <form
+                            className="flex flex-col gap-2"
+                            onSubmit={(event) => {
+                              event.preventDefault();
+                              setAgentPassword(agent.id);
+                            }}
+                          >
                             <Label htmlFor={`admin-password-${agent.id}`} className="text-xs">
                               Set new password (min {MIN_AGENT_PASSWORD_LENGTH} chars)
                             </Label>
@@ -3622,13 +3635,14 @@ export default function AgentDashboard() {
                             <div className="flex flex-wrap gap-2">
                               <Button
                                 size="sm"
-                                onClick={() => setAgentPassword(agent.id)}
+                                type="submit"
                                 disabled={!!adminPwdBusy[agent.id] || !(adminPwdMap[agent.id] || '').trim()}
                               >
                                 {adminPwdBusy[agent.id] ? 'Updating…' : 'Set password'}
                               </Button>
                               <Button
                                 size="sm"
+                                type="button"
                                 variant="outline"
                                 onClick={() => logoffAgent(agent.id)}
                                 disabled={isSelf || isOffline || !!adminLogoutBusy[agent.id]}
@@ -3641,6 +3655,7 @@ export default function AgentDashboard() {
                               </Button>
                               <Button
                                 size="sm"
+                                type="button"
                                 variant="destructive"
                                 onClick={() => deleteAgent(agent.id)}
                                 disabled={isSelf || !!adminDeleteBusy[agent.id]}
@@ -3648,7 +3663,7 @@ export default function AgentDashboard() {
                                 {adminDeleteBusy[agent.id] ? 'Deleting…' : 'Delete'}
                               </Button>
                             </div>
-                          </div>
+                          </form>
                         </div>
                       </div>
                     );

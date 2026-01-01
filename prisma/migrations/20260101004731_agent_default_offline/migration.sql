@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "Agent" ALTER COLUMN "status" SET DEFAULT 'OFFLINE';

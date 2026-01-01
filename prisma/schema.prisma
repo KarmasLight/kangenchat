@@ -30,7 +30,7 @@ model Agent {
   displayName String? 
   phone       String?
   avatarUrl   String?
-  status      AgentStatus @default(ONLINE)
+  status      AgentStatus @default(OFFLINE)
   role        AgentRole   @default(AGENT)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
